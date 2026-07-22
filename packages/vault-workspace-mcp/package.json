@@ -1,0 +1,23 @@
+{
+  "name": "vault-workspace-mcp",
+  "version": "0.1.0",
+  "description": "Zero-dependency stdio MCP server for agent work in an Obsidian vault: folder-scoped search/read/write, precise todo query, [/] marking, and a vault-wide write mutex. No delete surface; no scoring or gate logic.",
+  "license": "MIT",
+  "type": "module",
+  "main": "server.mjs",
+  "bin": {
+    "vault-workspace-mcp": "server.mjs"
+  },
+  "files": [
+    "server.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "obsidian",
+    "agent"
+  ]
+}

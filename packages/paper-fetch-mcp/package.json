@@ -1,0 +1,23 @@
+{
+  "name": "paper-fetch-mcp",
+  "version": "0.1.0",
+  "description": "Zero-dependency stdio MCP server: fetch arXiv paper full text with LaTeX math preserved (ar5iv HTML first, arXiv PDF via pdftotext fallback). Single tool: paper_fulltext_fetch.",
+  "license": "MIT",
+  "type": "module",
+  "main": "server.mjs",
+  "bin": {
+    "paper-fetch-mcp": "server.mjs"
+  },
+  "files": [
+    "server.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "arxiv",
+    "agent"
+  ]
+}
