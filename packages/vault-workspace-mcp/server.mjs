@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // vault-workspace-mcp — zero-dependency stdio MCP server for agent work in an Obsidian vault.
 //
-// Extracted from a prior internal tool: ONLY the Todo / lock / workspace file I/O surface.
+// Extracted from a prior internal tool: ONLY the Todo / workspace file I/O surface.
 // All scoring, round-recording, and citation-gate functions of the predecessor are
 // intentionally absent — verdicts and state transitions belong to the gate core, not to tools.
 //
@@ -11,8 +11,8 @@
 //   vault_write(file, content, mode?)                        -> create / overwrite / append (no delete surface)
 //   todo_query(folder?, tag?, status?, limit?)               -> task lines [{file,line,status,text}]
 //   todo_mark(file, line)                                    -> set checkbox to [/] (agent-processing-finished mark)
-//   workspace_lock_acquire(session_id, ttl_seconds?)         -> file-based mutex (O_EXCL, TTL)
-//   workspace_lock_release(session_id)                       -> release own lock
+//   (v0.2: workspace_lock_* removed — duplicate detection is the prepare gate's job;
+//    vault_write enforces WRITE_ROOTS — the machine write wall lives here, not in hooks)
 //
 // Config: VAULT_PATH env is REQUIRED (absolute path to the vault root). No fallback path.
 // Node built-ins only. stdout is reserved for JSON-RPC frames; logs go to stderr.
@@ -30,7 +30,7 @@ import path from 'node:path';
 
 const PROTOCOL = '2025-03-26';
 const SERVER_NAME = 'vault-workspace-mcp';
-const SERVER_VERSION = '0.1.0';
+const SERVER_VERSION = '0.2.0';
 
 const log = (...a) => process.stderr.write(a.join(' ') + '\n');
 
@@ -42,8 +42,26 @@ if (!VAULT || !path.isAbsolute(VAULT)) {
 
 const SKIP_DIRS = new Set(['.obsidian', '.trash', '.git', 'node_modules']);
 const TASK_RE = /^\s*[-*]\s*\[(.)\]\s?(.*)$/; // checkbox char + text
-const LOCK_FILE = path.join(VAULT, '.obsidian', 'agent-workspace.lock');
-const LOCK_TTL_MS = 3 * 60 * 1000;
+// --- write wall ----------------------------------------------------------------
+// WRITE_ROOTS: comma-separated vault-relative folders where vault_write may write
+// (the fixed write surface: fleeting root + work root). REQUIRED — this server IS
+// the wall since v0.2 (hooks are gone). '*' disables the wall (tests only).
+const WRITE_ROOTS_RAW = process.env.WRITE_ROOTS;
+if (!WRITE_ROOTS_RAW || !WRITE_ROOTS_RAW.trim()) {
+  log('FATAL: WRITE_ROOTS env var is required (comma-separated vault-relative write roots, or "*" for tests).');
+  process.exit(1);
+}
+const WRITE_ALL = WRITE_ROOTS_RAW.trim() === '*';
+const WRITE_ROOTS = WRITE_ALL ? [] : WRITE_ROOTS_RAW.split(',').map((r) => path.normalize(r.trim())).filter(Boolean);
+
+function assertWritable(relNorm) {
+  if (WRITE_ALL) return;
+  const ok = WRITE_ROOTS.some((root) => relNorm === root || relNorm.startsWith(root + path.sep));
+  if (!ok) {
+    log(`write denied (outside WRITE_ROOTS): ${relNorm}`);
+    throw new Error(`write denied — outside the write surface (WRITE_ROOTS): ${relNorm}`);
+  }
+}
 
 // --- path safety -------------------------------------------------------------
 // All tool paths are vault-relative. Reject absolute paths and traversal.
@@ -132,6 +150,7 @@ async function vaultWrite({ file, content, mode = 'create' } = {}) {
   if (typeof content !== 'string') throw new Error('content (string) is required');
   if (!['create', 'overwrite', 'append'].includes(mode)) throw new Error(`unknown mode: ${mode}`);
   const { rel, abs } = resolveRel(file);
+  assertWritable(rel);
   await fs.mkdir(path.dirname(abs), { recursive: true });
   if (mode === 'create') {
     try {
@@ -210,49 +229,6 @@ async function todoMark({ file, line } = {}) {
   return { ok: true, file: rel, line, old: original.trim(), new: updated.trim() };
 }
 
-// --- workspace lock (file-based mutex, O_EXCL + TTL) --------------------------
-async function lockAcquire({ session_id, ttl_seconds = 180 } = {}) {
-  if (!session_id || typeof session_id !== 'string') throw new Error('session_id is required');
-  const ttl = Math.min(Math.max(1, Number(ttl_seconds) || 180) * 1000, LOCK_TTL_MS);
-  try {
-    await fs.mkdir(path.dirname(LOCK_FILE), { recursive: true });
-    const fd = await fs.open(LOCK_FILE, 'wx'); // O_EXCL: fails if exists
-    await fd.writeFile(JSON.stringify({ session: session_id, acquired: Date.now(), ttl }));
-    await fd.close();
-    return { ok: true, session: session_id, ttl_seconds: ttl / 1000 };
-  } catch (e) {
-    if (e.code !== 'EEXIST') throw e;
-    try {
-      const data = JSON.parse(await fs.readFile(LOCK_FILE, 'utf8'));
-      const age = Date.now() - data.acquired;
-      if (age > data.ttl) {
-        await fs.unlink(LOCK_FILE).catch(() => {});
-        return await lockAcquire({ session_id, ttl_seconds });
-      }
-      return {
-        ok: false, retry_after: 60, holder: data.session,
-        held_for_seconds: Math.floor(age / 1000),
-        message: `Lock held by ${data.session}. Retry in 60s.`,
-      };
-    } catch {
-      return { ok: false, retry_after: 60, message: 'Lock file unreadable; retry in 60s.' };
-    }
-  }
-}
-
-async function lockRelease({ session_id } = {}) {
-  if (!session_id || typeof session_id !== 'string') throw new Error('session_id is required');
-  try {
-    const data = JSON.parse(await fs.readFile(LOCK_FILE, 'utf8'));
-    if (data.session !== session_id) return { ok: false, error: 'not_owner', holder: data.session };
-    await fs.unlink(LOCK_FILE);
-    return { ok: true, session: session_id };
-  } catch (e) {
-    if (e.code === 'ENOENT') return { ok: true, note: 'lock already released' };
-    return { ok: false, error: e.message };
-  }
-}
-
 // --- MCP tool registry --------------------------------------------------------
 const TOOLS = [
   {
@@ -301,21 +277,6 @@ const TOOLS = [
       line: { type: 'number', description: '1-indexed line number of the checkbox (from todo_query).' } },
       required: ['file', 'line'] },
   },
-  {
-    name: 'workspace_lock_acquire',
-    description: 'Acquire the vault-wide write mutex (atomic O_EXCL lock file with TTL, default/max 180s). Returns { ok } or { ok:false, retry_after, holder }. Expired locks are reaped automatically.',
-    inputSchema: { type: 'object', properties: {
-      session_id: { type: 'string', description: 'Caller identity for ownership checks (required).' },
-      ttl_seconds: { type: 'number', description: 'Lock TTL in seconds (default 180, cap 180).' } },
-      required: ['session_id'] },
-  },
-  {
-    name: 'workspace_lock_release',
-    description: 'Release the vault-wide write mutex. Only the holder (same session_id) may release; releasing an already-free lock is ok.',
-    inputSchema: { type: 'object', properties: {
-      session_id: { type: 'string', description: 'Must match the acquiring session_id.' } },
-      required: ['session_id'] },
-  },
 ];
 
 const HANDLERS = {
@@ -324,8 +285,6 @@ const HANDLERS = {
   vault_write: vaultWrite,
   todo_query: todoQuery,
   todo_mark: todoMark,
-  workspace_lock_acquire: lockAcquire,
-  workspace_lock_release: lockRelease,
 };
 
 async function callTool(name, args) {

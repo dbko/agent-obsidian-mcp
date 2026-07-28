@@ -1,6 +1,7 @@
 // tests/smoke-vault-workspace.mjs — end-to-end smoke over a temp fixture vault.
-// Covers all 7 tools + the deliberate boundaries (no delete, folder-required search,
-// '/'-only marking, path traversal rejection, .obsidian write rejection, lock mutex).
+// Covers all 5 tools + the deliberate boundaries (no delete, folder-required search,
+// '/'-only marking, path traversal rejection, .obsidian write rejection,
+// and the v0.2 write wall: WRITE_ROOTS allow/deny).
 
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -27,7 +28,7 @@ writeFileSync(path.join(vault, 'initiatives', 'sub-a.md'), [
 ].join('\n'));
 writeFileSync(path.join(vault, 'initiatives', 'sub-b.md'), '# Sub B\n- [/] 이미 처리된 일 #agent/todo\n');
 
-const srv = startServer(SERVER, { VAULT_PATH: vault });
+const srv = startServer(SERVER, { VAULT_PATH: vault, WRITE_ROOTS: 'fleeting,work' });
 await new Promise(r => setTimeout(r, 300));
 
 try {
@@ -36,8 +37,8 @@ try {
   check('initialize', init.result?.serverInfo?.name === 'vault-workspace-mcp');
   const list = await srv.rpc('tools/list', {});
   const names = (list.result?.tools || []).map(t => t.name).sort();
-  check('tool surface = 7 canonical tools',
-    JSON.stringify(names) === JSON.stringify(['todo_mark', 'todo_query', 'vault_read', 'vault_search', 'vault_write', 'workspace_lock_acquire', 'workspace_lock_release'].sort()),
+  check('tool surface = 5 canonical tools (v0.2: no lock tools)',
+    JSON.stringify(names) === JSON.stringify(['todo_mark', 'todo_query', 'vault_read', 'vault_search', 'vault_write'].sort()),
     names.join(','));
 
   // todo_query: open only, fence skipped, file·line returned
@@ -69,6 +70,14 @@ try {
   r = await srv.callTool('vault_write', { file: '.obsidian/app.json', content: '{}', mode: 'overwrite' });
   check('vault_write rejects .obsidian/', r.isError);
 
+  // v0.2 write wall: WRITE_ROOTS enforcement
+  r = await srv.callTool('vault_write', { file: 'fleeting/idea.md', content: 'inside wall' });
+  check('write inside WRITE_ROOTS (fleeting) allowed', r.data?.ok === true);
+  r = await srv.callTool('vault_write', { file: 'initiatives/sub-a.md', content: 'x', mode: 'append' });
+  check('write outside WRITE_ROOTS denied', r.isError && r.text.includes('write surface'), r.text);
+  r = await srv.callTool('vault_write', { file: 'worknote.md', content: 'x' });
+  check('prefix trick (worknote vs work/) denied', r.isError, r.text);
+
   // todo_mark: '/'-only semantics + idempotency
   r = await srv.callTool('todo_mark', { file: 'initiatives/sub-a.md', line: 2 });
   check('todo_mark sets [/]', r.data?.ok === true && r.data?.new?.includes('[/]'));
@@ -77,15 +86,6 @@ try {
   r = await srv.callTool('todo_mark', { file: 'initiatives/sub-a.md', line: 8 });
   check('todo_mark refuses non-checkbox line', r.data?.ok === false);
 
-  // locks: mutex + owner check + release
-  r = await srv.callTool('workspace_lock_acquire', { session_id: 'alpha' });
-  check('lock acquire', r.data?.ok === true);
-  r = await srv.callTool('workspace_lock_acquire', { session_id: 'beta' });
-  check('second acquire blocked with holder info', r.data?.ok === false && r.data?.holder === 'alpha');
-  r = await srv.callTool('workspace_lock_release', { session_id: 'beta' });
-  check('non-owner release refused', r.data?.ok === false && r.data?.error === 'not_owner');
-  r = await srv.callTool('workspace_lock_release', { session_id: 'alpha' });
-  check('owner release', r.data?.ok === true);
 
   // no delete surface at all
   r = await srv.callTool('vault_delete', { file: 'work/w-1/note.md' });

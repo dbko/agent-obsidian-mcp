@@ -4,7 +4,7 @@ Local MCP servers for the Agent-Obsidian workflow. One repo · one version tag �
 
 | Package | Tool surface | Purpose |
 |---|---|---|
-| [`vault-workspace-mcp`](packages/vault-workspace-mcp/) | `vault_search` · `vault_read` · `vault_write` · `todo_query` · `todo_mark` · `workspace_lock_acquire` · `workspace_lock_release` | Agent file I/O, todo detection/marking, and the vault-wide write mutex. |
+| [`vault-workspace-mcp`](packages/vault-workspace-mcp/) | `vault_search` · `vault_read` · `vault_write` · `todo_query` · `todo_mark` | Agent file I/O behind a WRITE_ROOTS write wall, todo detection/marking. (v0.2: lock tools removed — duplicate detection belongs to the prepare gate.) |
 | [`paper-fetch-mcp`](packages/paper-fetch-mcp/) | `paper_fulltext_fetch` | arXiv full text with LaTeX math (ar5iv HTML → pdftotext fallback). |
 
 Both servers are **zero-dependency single files** (Node ≥ 18 built-ins only; `paper-fetch-mcp` additionally shells out to `pdftotext` for its PDF fallback).
