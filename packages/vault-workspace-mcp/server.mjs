@@ -8,29 +8,37 @@
 // Tools (canonical names per workflow capability registry):
 //   vault_search(folder, query?, name_pattern?, limit?)      -> matching lines / files (folder scope REQUIRED)
 //   vault_read(file, offset?, limit?)                        -> file content (paged)
-//   vault_write(file, content, mode?)                        -> create / overwrite / append (no delete surface)
-//   todo_query(folder?, tag?, status?, limit?)               -> task lines [{file,line,status,text}]
-//   todo_mark(file, line)                                    -> set checkbox to [/] (agent-processing-finished mark)
+//   vault_write(file, content, mode?)                        -> create / overwrite / append (walled by WRITE_ROOTS)
+//   vault_delete(path, recursive?)                           -> remove under DELETE_ROOTS (absent if unconfigured)
+//   todo_query(folder?, tag?, status?, limit?)               -> task lines [{file,line,status,mark,text}]
+//   todo_mark(file, line, mark?)                             -> set checkbox to one of MARK_VALUES
 //   (v0.2: workspace_lock_* removed — duplicate detection is the prepare gate's job;
 //    vault_write enforces WRITE_ROOTS — the machine write wall lives here, not in hooks)
 //
-// Config: VAULT_PATH env is REQUIRED (absolute path to the vault root). No fallback path.
+// Config (env): VAULT_PATH (required, absolute) · WRITE_ROOTS (required) ·
+//               MARK_VALUES (required) · DELETE_ROOTS (optional — no value, no delete tool).
 // Node built-ins only. stdout is reserved for JSON-RPC frames; logs go to stderr.
 //
 // Deliberate boundaries (from the workflow's base rules):
-//   - No delete tool: deletion is user-only, so the surface simply does not exist here.
+//   - Delete is walled SEPARATELY from write (DELETE_ROOTS ⊆ intent of the work root):
+//     the gate needs cleanup (write-probe removal, half-made work folders, failed artifacts),
+//     but a write surface is not automatically a delete surface. No DELETE_ROOTS, no tool.
+//   - todo_mark writes only MARK_VALUES — the agent-processing-finished marks decided at
+//     install (one per outcome). '[x]' and '[ ]' are user-only: the final confirmation and
+//     the re-open are the user's, so they are refused unconditionally, not by config.
+//   - Marks are refused on lines inside fenced code blocks — example todos in policy notes
+//     are not real triggers (todo_query already skips them; todo_mark agrees).
 //   - vault_search requires a folder scope: full-vault scans are not offered.
-//   - todo_mark writes only '/': the final [x] belongs to the user, and other states
-//     belong to editing flows, not to this minimal marking tool.
-//   - Paths are vault-relative; absolute paths and traversal ('..') are rejected.
-//   - vault_write cannot touch '.obsidian/' (app config is not a work area).
+//   - Paths are vault-relative; absolute paths and traversal ('..') are rejected, and the
+//     resolved real path must stay inside the vault (symlinks cannot tunnel out of a wall).
+//   - vault_write / vault_delete cannot touch '.obsidian/' (app config is not a work area).
 
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
 const PROTOCOL = '2025-03-26';
 const SERVER_NAME = 'vault-workspace-mcp';
-const SERVER_VERSION = '0.2.0';
+const SERVER_VERSION = '0.3.0';
 
 const log = (...a) => process.stderr.write(a.join(' ') + '\n');
 
@@ -39,28 +47,87 @@ if (!VAULT || !path.isAbsolute(VAULT)) {
   log('FATAL: VAULT_PATH env var is required and must be an absolute path to the vault root.');
   process.exit(1);
 }
+// The vault itself may sit under a symlinked ancestor — compare real paths, not declared ones.
+const VAULT_REAL = await fs.realpath(VAULT).catch(() => {
+  log(`FATAL: VAULT_PATH does not resolve: ${VAULT}`);
+  process.exit(1);
+});
 
 const SKIP_DIRS = new Set(['.obsidian', '.trash', '.git', 'node_modules']);
 const TASK_RE = /^\s*[-*]\s*\[(.)\]\s?(.*)$/; // checkbox char + text
-// --- write wall ----------------------------------------------------------------
-// WRITE_ROOTS: comma-separated vault-relative folders where vault_write may write
-// (the fixed write surface: fleeting root + work root). REQUIRED — this server IS
-// the wall since v0.2 (hooks are gone). '*' disables the wall (tests only).
+
+// --- roots (walls) -------------------------------------------------------------
+// Comma-separated vault-relative folders. '*' disables a wall (tests only).
+function parseRoots(raw) {
+  if (raw.trim() === '*') return { all: true, roots: [] };
+  return { all: false, roots: raw.split(',').map((r) => path.normalize(r.trim())).filter(Boolean) };
+}
+
+// WRITE_ROOTS: the fixed write surface (fleeting root + work root). REQUIRED — this
+// server IS the wall since v0.2 (hooks are gone).
 const WRITE_ROOTS_RAW = process.env.WRITE_ROOTS;
 if (!WRITE_ROOTS_RAW || !WRITE_ROOTS_RAW.trim()) {
   log('FATAL: WRITE_ROOTS env var is required (comma-separated vault-relative write roots, or "*" for tests).');
   process.exit(1);
 }
-const WRITE_ALL = WRITE_ROOTS_RAW.trim() === '*';
-const WRITE_ROOTS = WRITE_ALL ? [] : WRITE_ROOTS_RAW.split(',').map((r) => path.normalize(r.trim())).filter(Boolean);
+const WRITE = parseRoots(WRITE_ROOTS_RAW);
+
+// DELETE_ROOTS: OPTIONAL and separate. Unset means this deployment has no delete
+// surface at all — the tool is not registered, so its absence is visible in tools/list
+// instead of surfacing as a runtime error on every call.
+const DELETE_ROOTS_RAW = process.env.DELETE_ROOTS || '';
+const DELETE_ENABLED = Boolean(DELETE_ROOTS_RAW.trim());
+const DELETE = DELETE_ENABLED ? parseRoots(DELETE_ROOTS_RAW) : { all: false, roots: [] };
+
+// MARK_VALUES: the agent-processing-finished checkbox chars decided at install — one per
+// outcome (accepted / failed). REQUIRED: a silent single-value default would let a
+// deployment close both outcomes with the same mark and never notice.
+// '[x]' (user's final confirmation) and '[ ]' (re-open) are refused here, not by config.
+const RESERVED_MARKS = new Map([
+  [' ', "'[ ]' is the open state — re-opening a todo is the user's"],
+  ['x', "'[x]' is the user's final confirmation"],
+  ['X', "'[x]' is the user's final confirmation"],
+]);
+const MARK_VALUES_RAW = process.env.MARK_VALUES;
+if (!MARK_VALUES_RAW || !MARK_VALUES_RAW.trim()) {
+  log('FATAL: MARK_VALUES env var is required (comma-separated checkbox chars, one per outcome — e.g. "/,!").');
+  process.exit(1);
+}
+const MARK_VALUES = MARK_VALUES_RAW.split(',').map((m) => m.trim()).filter(Boolean);
+for (const m of MARK_VALUES) {
+  if (m.length !== 1) {
+    log(`FATAL: MARK_VALUES entries must be single characters: ${JSON.stringify(m)}`);
+    process.exit(1);
+  }
+  if (RESERVED_MARKS.has(m)) {
+    log(`FATAL: MARK_VALUES may not contain ${JSON.stringify(m)} — ${RESERVED_MARKS.get(m)}.`);
+    process.exit(1);
+  }
+}
+const MARK_SET = new Set(MARK_VALUES);
+
+function underRoot(relNorm, root) {
+  return relNorm === root || relNorm.startsWith(root + path.sep);
+}
 
 function assertWritable(relNorm) {
-  if (WRITE_ALL) return;
-  const ok = WRITE_ROOTS.some((root) => relNorm === root || relNorm.startsWith(root + path.sep));
-  if (!ok) {
+  if (WRITE.all) return;
+  if (!WRITE.roots.some((root) => underRoot(relNorm, root))) {
     log(`write denied (outside WRITE_ROOTS): ${relNorm}`);
     throw new Error(`write denied — outside the write surface (WRITE_ROOTS): ${relNorm}`);
   }
+}
+
+// Delete is stricter than write: the target must be strictly INSIDE a root.
+// Deleting a root itself would take the work area (or the fleeting area) with it.
+function assertDeletable(relNorm) {
+  if (DELETE.all) return;
+  const root = DELETE.roots.find((r) => underRoot(relNorm, r));
+  if (!root) {
+    log(`delete denied (outside DELETE_ROOTS): ${relNorm}`);
+    throw new Error(`delete denied — outside the delete surface (DELETE_ROOTS): ${relNorm}`);
+  }
+  if (relNorm === root) throw new Error(`delete denied — this is a delete root itself: ${relNorm}`);
 }
 
 // --- path safety -------------------------------------------------------------
@@ -73,6 +140,31 @@ function resolveRel(rel, { allowObsidian = false } = {}) {
   if (!allowObsidian && (norm === '.obsidian' || norm.startsWith('.obsidian' + path.sep)))
     throw new Error(`'.obsidian/' is not a work area: ${rel}`);
   return { rel: norm, abs: path.join(VAULT, norm) };
+}
+
+// String prefixes alone do not make a wall: a symlink inside a root can point anywhere.
+// Resolve the deepest EXISTING ancestor, re-attach the not-yet-created tail, and return
+// the real vault-relative path — the roots are then checked against that.
+async function realRel(abs, declaredRel) {
+  let probe = abs;
+  for (;;) {
+    let real;
+    try {
+      real = await fs.realpath(probe);
+    } catch (e) {
+      if (e.code !== 'ENOENT' && e.code !== 'ENOTDIR') throw e;
+      const parent = path.dirname(probe);
+      if (parent === probe) throw new Error(`cannot resolve path: ${declaredRel}`);
+      probe = parent;
+      continue;
+    }
+    const tail = path.relative(probe, abs);
+    const realFull = tail ? path.join(real, tail) : real;
+    const rel = path.relative(VAULT_REAL, realFull);
+    if (rel.startsWith('..') || path.isAbsolute(rel))
+      throw new Error(`path escapes the vault through a link: ${declaredRel}`);
+    return rel;
+  }
 }
 
 // --- walk (folder-scoped) -----------------------------------------------------
@@ -150,7 +242,7 @@ async function vaultWrite({ file, content, mode = 'create' } = {}) {
   if (typeof content !== 'string') throw new Error('content (string) is required');
   if (!['create', 'overwrite', 'append'].includes(mode)) throw new Error(`unknown mode: ${mode}`);
   const { rel, abs } = resolveRel(file);
-  assertWritable(rel);
+  assertWritable(await realRel(abs, rel));
   await fs.mkdir(path.dirname(abs), { recursive: true });
   if (mode === 'create') {
     try {
@@ -169,13 +261,53 @@ async function vaultWrite({ file, content, mode = 'create' } = {}) {
   return { ok: true, file: rel, mode, bytes: Buffer.byteLength(content, 'utf8') };
 }
 
+// --- vault_delete ---------------------------------------------------------------
+// Cleanup surface for the gates: the write-probe the prepare gate removes immediately,
+// a half-made work folder (left behind, it would block its source as duplicate forever),
+// and failed artifacts inside a work folder. Walled by DELETE_ROOTS, absent without it.
+// Idempotent: a missing target is the desired end state, not an error.
+async function countEntries(abs) {
+  let n = 1;
+  let entries;
+  try { entries = await fs.readdir(abs, { withFileTypes: true }); } catch { return n; }
+  for (const e of entries) n += e.isDirectory() ? await countEntries(path.join(abs, e.name)) : 1;
+  return n;
+}
+
+async function vaultDelete({ path: target, recursive = false } = {}) {
+  const { rel, abs } = resolveRel(target);
+  assertDeletable(await realRel(abs, rel));
+  let st;
+  try {
+    st = await fs.lstat(abs);
+  } catch (e) {
+    if (e.code === 'ENOENT') return { ok: true, path: rel, unchanged: true, reason: 'already absent' };
+    throw e;
+  }
+  // A symlink inside the work area is anomalous — removing it is not what a cleanup means,
+  // and following it would act outside the wall. Refuse and let a human look.
+  if (st.isSymbolicLink()) throw new Error(`delete denied — target is a symlink: ${rel}`);
+  if (st.isDirectory()) {
+    if (recursive !== true)
+      throw new Error(`target is a folder — pass recursive:true to remove it and its contents: ${rel}`);
+    const removed = await countEntries(abs);
+    await fs.rm(abs, { recursive: true, force: true });
+    return { ok: true, path: rel, kind: 'folder', recursive: true, removed_entries: removed };
+  }
+  await fs.rm(abs, { force: true });
+  return { ok: true, path: rel, kind: 'file', bytes: st.size };
+}
+
 // --- todo_query ---------------------------------------------------------------
-// [ ]=open · [x]/[X]=done · [/]=agent_finished (agent processing finished — never re-triggered) · other=in_progress
+// [ ]=open · [x]/[X]=done · MARK_VALUES=agent_finished (processing finished — never
+// re-triggered) · anything else=in_progress.
+// The agent-finished marks come from config, so a `status:"open"` query never returns a
+// todo this deployment has already closed — the source of infinite re-discovery.
 // Fenced code blocks are skipped: example todos inside policy/example notes are not real candidates.
 function classify(ch) {
   if (ch === ' ') return 'open';
   if (ch === 'x' || ch === 'X') return 'done';
-  if (ch === '/') return 'agent_finished';
+  if (MARK_SET.has(ch)) return 'agent_finished';
   return 'in_progress';
 }
 
@@ -200,7 +332,7 @@ async function todoQuery({ folder = '', tag = '#agent/todo', status = 'open', li
       if (status !== 'all' && st !== status) continue;
       const text = m[2].trim();
       if (tag && !text.includes(tag)) continue; // same-line co-occurrence (precise)
-      rows.push({ file: rel, line: i + 1, status: st, text });
+      rows.push({ file: rel, line: i + 1, status: st, mark: m[1], text });
       if (rows.length >= cap) { truncated = true; break; }
     }
     if (truncated) break;
@@ -209,24 +341,48 @@ async function todoQuery({ folder = '', tag = '#agent/todo', status = 'open', li
 }
 
 // --- todo_mark ----------------------------------------------------------------
-// Sets a checkbox to '[/]' ONLY (agent-processing-finished mark, applied by gates).
-// '[x]' is user-only by workflow rule and is deliberately not writable here.
-async function todoMark({ file, line } = {}) {
+// Sets a checkbox to one of MARK_VALUES (the agent-processing-finished marks, applied by
+// gates — one per outcome). '[x]' and '[ ]' are the user's and are never writable here.
+// Marking is deliberately NOT walled by WRITE_ROOTS: todos live wherever the user keeps
+// them. The wall here is the operation itself — one character, from a fixed set.
+async function todoMark({ file, line, mark } = {}) {
   if (!line || typeof line !== 'number') throw new Error('line (1-indexed number) is required');
+  if (mark === undefined || mark === null) {
+    if (MARK_VALUES.length > 1)
+      throw new Error(`mark is required — this deployment has several: ${MARK_VALUES.join(', ')}`);
+    mark = MARK_VALUES[0];
+  }
+  if (typeof mark !== 'string' || !MARK_SET.has(mark)) {
+    const why = RESERVED_MARKS.get(mark);
+    throw new Error(
+      why
+        ? `mark ${JSON.stringify(mark)} is refused — ${why}.`
+        : `unknown mark ${JSON.stringify(mark)} — allowed: ${MARK_VALUES.join(', ')}`,
+    );
+  }
   const { rel, abs } = resolveRel(file);
   const content = await fs.readFile(abs, 'utf8');
   const lines = content.split('\n');
   const idx = line - 1;
   if (idx < 0 || idx >= lines.length)
     return { ok: false, error: `line ${line} out of range (file has ${lines.length} lines)` };
+  // A line inside a fenced block is an example, not a trigger — todo_query skips those,
+  // so a line number that reaches here pointing into a fence did not come from a query.
+  let inFence = false;
+  for (let i = 0; i < idx; i++) if (/^\s*(```|~~~)/.test(lines[i])) inFence = !inFence;
+  if (inFence)
+    return { ok: false, error: 'line is inside a fenced code block (an example, not a trigger)', line: lines[idx].trim() };
   const original = lines[idx];
   const m = TASK_RE.exec(original);
   if (!m) return { ok: false, error: 'line does not contain a checkbox', line: original.trim() };
-  if (m[1] === '/') return { ok: true, file: rel, line, unchanged: true, text: original.trim() }; // idempotent
-  const updated = original.replace(/^(\s*[-*]\s*\[)(.)(\].*)$/, `$1/$3`);
+  // The user's final confirmation is not ours to undo.
+  if (m[1] === 'x' || m[1] === 'X')
+    return { ok: false, error: "line is already '[x]' — the user's final confirmation is not overwritten", line: original.trim() };
+  if (m[1] === mark) return { ok: true, file: rel, line, mark, unchanged: true, text: original.trim() }; // idempotent
+  const updated = original.replace(/^(\s*[-*]\s*\[)(.)(\].*)$/, `$1${mark}$3`);
   lines[idx] = updated;
   await fs.writeFile(abs, lines.join('\n'), 'utf8');
-  return { ok: true, file: rel, line, old: original.trim(), new: updated.trim() };
+  return { ok: true, file: rel, line, mark, old: original.trim(), new: updated.trim() };
 }
 
 // --- MCP tool registry --------------------------------------------------------
@@ -252,7 +408,7 @@ const TOOLS = [
   },
   {
     name: 'vault_write',
-    description: 'Write a file by vault-relative path. mode "create" (default, fails if the file exists), "overwrite", or "append". Parent folders are created. There is NO delete tool in this server — deletion is user-only by workflow rule. ".obsidian/" is rejected.',
+    description: 'Write a file by vault-relative path. mode "create" (default, fails if the file exists), "overwrite", or "append". Parent folders are created. Walled: writes outside WRITE_ROOTS are refused, and ".obsidian/" is rejected.',
     inputSchema: { type: 'object', properties: {
       file: { type: 'string', description: 'Vault-relative file path.' },
       content: { type: 'string', description: 'Full text to write (or to append).' },
@@ -261,7 +417,7 @@ const TOOLS = [
   },
   {
     name: 'todo_query',
-    description: 'Find checkbox task lines, precisely and token-cheaply (returns only matching lines, never whole notes). Filters: folder scope, same-line tag (default "#agent/todo"), status: open ([ ]) / agent_finished ([/]) / done ([x]) / in_progress / all. Fenced code blocks are skipped (example todos in policy docs are not candidates). Returns [{file,line,status,text}] — use file·line as the immutable request-source reference.',
+    description: `Find checkbox task lines, precisely and token-cheaply (returns only matching lines, never whole notes). Filters: folder scope, same-line tag (default "#agent/todo"), status: open ([ ]) / agent_finished (this deployment's marks: ${MARK_VALUES.join(' ')}) / done ([x]) / in_progress / all. A "open" query never returns an already-marked todo. Fenced code blocks are skipped (example todos in policy docs are not candidates). Returns [{file,line,status,mark,text}] — use file·line as the immutable request-source reference.`,
     inputSchema: { type: 'object', properties: {
       folder: { type: 'string', description: 'Vault-relative folder scope (recommended; default: whole vault).' },
       tag: { type: 'string', description: 'Same-line tag filter (default "#agent/todo"; empty string disables).' },
@@ -271,13 +427,25 @@ const TOOLS = [
   },
   {
     name: 'todo_mark',
-    description: "Set a checkbox line to '[/]' — the agent-processing-finished mark applied by gates (idempotent: already-[/] lines return unchanged:true). This tool writes ONLY '/'; the final '[x]' is user-only by workflow rule and cannot be written here.",
+    description: `Set a checkbox line to an agent-processing-finished mark, applied by gates (idempotent: an already-marked line returns unchanged:true). Allowed marks in this deployment: ${MARK_VALUES.join(' ')} — one per outcome. '[x]' (the user's final confirmation) and '[ ]' (re-open) are user-only and cannot be written here, and an already-'[x]' line is refused. Lines inside fenced code blocks are refused.`,
     inputSchema: { type: 'object', properties: {
       file: { type: 'string', description: 'Vault-relative file path.' },
-      line: { type: 'number', description: '1-indexed line number of the checkbox (from todo_query).' } },
+      line: { type: 'number', description: '1-indexed line number of the checkbox (from todo_query).' },
+      mark: { type: 'string', enum: MARK_VALUES, description: `The mark to write. Required when several are configured (here: ${MARK_VALUES.join(' ')}).` } },
       required: ['file', 'line'] },
   },
 ];
+
+if (DELETE_ENABLED) {
+  TOOLS.splice(3, 0, {
+    name: 'vault_delete',
+    description: 'Remove a file or folder by vault-relative path — the gates\' cleanup surface (removing a write probe, a half-made work folder, a failed artifact). Walled separately from writing: only paths strictly inside DELETE_ROOTS, never a root itself. Folders need recursive:true. Idempotent: an absent target returns ok with unchanged:true. Symlinks are refused.',
+    inputSchema: { type: 'object', properties: {
+      path: { type: 'string', description: 'Vault-relative file or folder path.' },
+      recursive: { type: 'boolean', description: 'Required (true) to remove a folder and its contents.' } },
+      required: ['path'] },
+  });
+}
 
 const HANDLERS = {
   vault_search: vaultSearch,
@@ -285,6 +453,7 @@ const HANDLERS = {
   vault_write: vaultWrite,
   todo_query: todoQuery,
   todo_mark: todoMark,
+  ...(DELETE_ENABLED ? { vault_delete: vaultDelete } : {}),
 };
 
 async function callTool(name, args) {
@@ -338,3 +507,6 @@ process.stdin.on('data', (chunk) => {
   }
 });
 log(`${SERVER_NAME} ${SERVER_VERSION} ready (vault: ${VAULT})`);
+log(`  write roots: ${WRITE.all ? '* (wall disabled)' : WRITE.roots.join(', ')}`);
+log(`  delete roots: ${DELETE_ENABLED ? (DELETE.all ? '* (wall disabled)' : DELETE.roots.join(', ')) : 'none — vault_delete not registered'}`);
+log(`  marks: ${MARK_VALUES.join(' ')}`);
