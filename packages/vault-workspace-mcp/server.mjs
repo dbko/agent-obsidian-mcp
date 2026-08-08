@@ -37,7 +37,7 @@ import path from 'node:path';
 
 const PROTOCOL = '2025-03-26';
 const SERVER_NAME = 'vault-workspace-mcp';
-const SERVER_VERSION = '0.4.0';
+const SERVER_VERSION = '0.4.1';
 
 const log = (...a) => process.stderr.write(a.join(' ') + '\n');
 
@@ -368,6 +368,7 @@ async function todoQuery({ folder = '', limit = 200 } = {}) {
   const cap = Math.max(1, Math.min(1000, Number(limit) || 200));
   const files = (await walk(scopeAbs)).sort();
   const rows = [];
+  const ambiguous = [];
   let truncated = false;
   for (const f of files) {
     const rel = path.relative(VAULT, f);
@@ -375,6 +376,12 @@ async function todoQuery({ folder = '', limit = 200 } = {}) {
     try { content = await fs.readFile(f, 'utf8'); } catch { continue; }
     const lines = content.split('\n');
     let inFence = false;
+    // Collect the whole file before emitting any of it. An identical todo line
+    // repeated in one file hashes to a single fingerprint, and nothing here or
+    // in todo_transition can tell those sources apart — so they must be found
+    // together. Emitting under the cap first could cut the pair and let the
+    // surviving half look unique.
+    const hits = [];
     for (let i = 0; i < lines.length; i++) {
       if (/^\s*(```|~~~)/.test(lines[i])) { inFence = !inFence; continue; }
       if (inFence) continue;
@@ -383,12 +390,23 @@ async function todoQuery({ folder = '', limit = 200 } = {}) {
       if (m[2] !== ' ') continue;
       const text = m[3].trim();
       if (!TODO_SELECTOR_RE.test(text)) continue;
-      rows.push({ file: rel, line: i + 1, mark: m[2], text, fingerprint: taskFingerprint(rel, lines[i]) });
+      hits.push({ file: rel, line: i + 1, mark: m[2], text, fingerprint: taskFingerprint(rel, lines[i]) });
+    }
+    const occurrences = new Map();
+    for (const h of hits) occurrences.set(h.fingerprint, (occurrences.get(h.fingerprint) || 0) + 1);
+    for (const h of hits) {
+      // Fail closed here rather than at the end of a run: todo_transition would
+      // refuse this source as a conflict at finalize time, after the work is done.
+      if (occurrences.get(h.fingerprint) > 1) {
+        ambiguous.push({ ...h, reason: 'duplicate_source — an identical todo line appears more than once in this file, so no fingerprint identifies one of them' });
+        continue;
+      }
       if (rows.length >= cap) { truncated = true; break; }
+      rows.push(h);
     }
     if (truncated) break;
   }
-  return { count: rows.length, truncated, rows };
+  return { count: rows.length, truncated, rows, ambiguous_count: ambiguous.length, ambiguous };
 }
 
 function oneLine(value, name) {
@@ -423,8 +441,10 @@ async function todoTransition({ file, fingerprint, state, work_id, question, wor
     if (m && TODO_SELECTOR_RE.test(m[3].trim()) && taskFingerprint(rel, lines[i]) === fingerprint)
       matches.push(i);
   }
-  if (matches.length !== 1)
-    throw new Error(`source_conflict — fingerprint matched ${matches.length} todos`);
+  if (matches.length === 0)
+    throw new Error('source_conflict — no todo matches this fingerprint; the source line was edited, moved or removed');
+  if (matches.length > 1)
+    throw new Error(`source_conflict — ${matches.length} identical todo lines share this fingerprint, so none of them can be identified as the source (todo_query reports these as ambiguous)`);
   const idx = matches[0];
   const original = lines[idx];
   const m = TASK_RE.exec(original);
@@ -482,7 +502,7 @@ const TOOLS = [
   },
   {
     name: 'todo_query',
-    description: `Return only open [ ] todos whose same line contains the exact configured selector token ${JSON.stringify(TODO_SELECTOR)}. Configured marks, other checkbox states, partial tag matches, and fenced examples are excluded. Returns file, line, text, and a stable source fingerprint.`,
+    description: `Return only open [ ] todos whose same line contains the exact configured selector token ${JSON.stringify(TODO_SELECTOR)}. Configured marks, other checkbox states, partial tag matches, and fenced examples are excluded. Returns file, line, text, and a stable source fingerprint. Identical todo lines repeated in one file share a fingerprint and cannot be told apart; they are withheld from rows and listed under ambiguous instead.`,
     inputSchema: { type: 'object', properties: {
       folder: { type: 'string', description: 'Vault-relative folder scope (recommended; default: whole vault).' },
       limit: { type: 'number', description: 'Max rows (default 200, cap 1000).' } },

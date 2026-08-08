@@ -55,7 +55,7 @@ try {
   // initialize / tools list
   const init = await srv.rpc('initialize', { protocolVersion: '2025-03-26' });
   check('initialize', init.result?.serverInfo?.name === 'vault-workspace-mcp');
-  check('version is 0.4.0', init.result?.serverInfo?.version === '0.4.0', init.result?.serverInfo?.version);
+  check('version is 0.4.1', init.result?.serverInfo?.version === '0.4.1', init.result?.serverInfo?.version);
   const list = await srv.rpc('tools/list', {});
   const names = (list.result?.tools || []).map(t => t.name).sort();
   check('tool surface = 6 scoped tools',
@@ -158,6 +158,33 @@ try {
   check('failed transition uses configured mark', r.data?.state === 'failed' && r.data?.mark === '!');
   r = await srv.callTool('todo_query', { folder: 'initiatives' });
   check('all transitioned todos leave the open set', r.data?.count === 0, JSON.stringify(r.data?.rows));
+
+  // Indistinguishable duplicates: two identical todo lines in one file share a
+  // fingerprint, so neither can be closed. They must be withheld up front, not
+  // discovered at finalize time. Its own folder — the checks above are scoped.
+  mkdirSync(path.join(vault, 'dup'), { recursive: true });
+  writeFileSync(path.join(vault, 'dup', 'twins.md'), [
+    '# Twins',
+    '- [ ] 같은 문장 작업 #agent/todo',
+    '- [ ] 구별되는 작업 #agent/todo',
+    '- [ ] 같은 문장 작업 #agent/todo',
+  ].join('\n'));
+  r = await srv.callTool('todo_query', { folder: 'dup' });
+  check('duplicate todo lines are withheld from rows', r.data?.count === 1 && r.data?.rows?.[0]?.text.startsWith('구별되는'), JSON.stringify(r.data?.rows));
+  check('  ... and reported as ambiguous with a reason', r.data?.ambiguous_count === 2 && /duplicate_source/.test(r.data?.ambiguous?.[0]?.reason || ''), JSON.stringify(r.data?.ambiguous));
+  check('  ... the duplicates share one fingerprint', r.data?.ambiguous?.[0]?.fingerprint === r.data?.ambiguous?.[1]?.fingerprint);
+  check('  ... and are two distinct lines', r.data?.ambiguous?.[0]?.line === 2 && r.data?.ambiguous?.[1]?.line === 4, JSON.stringify(r.data?.ambiguous));
+  r = await srv.callTool('todo_transition', {
+    file: path.join('dup', 'twins.md'), fingerprint: r.data.ambiguous[0].fingerprint,
+    state: 'succeeded', work_id: 'w-test-0003', result_link: '[[work/w-test-0003/result.md]]',
+  });
+  check('transitioning an ambiguous source fails closed', r.isError && /source_conflict — 2 identical/.test(r.text), r.text);
+  check('  ... and the file is untouched', readFileSync(path.join(vault, 'dup', 'twins.md'), 'utf8').split('[ ]').length === 4);
+  r = await srv.callTool('todo_transition', {
+    file: path.join('dup', 'twins.md'), fingerprint: 'f'.repeat(64),
+    state: 'succeeded', work_id: 'w-test-0004', result_link: '[[work/w-test-0004/result.md]]',
+  });
+  check('  ... no match reports the edited/moved/removed case', r.isError && /no todo matches this fingerprint/.test(r.text), r.text);
 
   // vault_delete: the gates' cleanup surface, walled separately
   r = await srv.callTool('vault_write', { file: 'work/w-2/probe.tmp', content: 'probe' });
