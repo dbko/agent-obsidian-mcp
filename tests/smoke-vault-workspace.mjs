@@ -1,9 +1,8 @@
 // tests/smoke-vault-workspace.mjs — end-to-end smoke over a temp fixture vault.
-// Covers all 6 tools + the deliberate boundaries: folder-required search, the WRITE_ROOTS
-// wall, the separate DELETE_ROOTS wall (v0.3), configured marks with '[x]'/'[ ]' refused,
-// fenced-block refusal, path traversal, .obsidian rejection, and symlink tunnelling.
+// Covers scoped reads/writes/deletes, exact Todo selection, source fingerprints,
+// atomic semantic transitions, fenced examples, traversal, and symlink tunnelling.
 
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, existsSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,12 +17,15 @@ const outside = mkdtempSync(path.join(tmpdir(), 'vws-outside-'));
 writeFileSync(path.join(outside, 'precious.md'), 'must survive\n');
 mkdirSync(path.join(vault, 'initiatives'), { recursive: true });
 mkdirSync(path.join(vault, '.obsidian'), { recursive: true });
+mkdirSync(path.join(vault, '.claude'), { recursive: true });
 mkdirSync(path.join(vault, 'work'), { recursive: true });
+writeFileSync(path.join(vault, '.claude', 'secret.md'), 'must not be readable\n');
 writeFileSync(path.join(vault, 'initiatives', 'sub-a.md'), [
   '# Sub A',
   '- [ ] 수집 작업 하나 #agent/todo',
   '- [x] 끝난 일 #agent/todo',
   '- [ ] 태그 없는 일',
+  '- [ ] 비슷하지만 다른 태그 #agent/todolist',
   '```',
   '- [ ] 예시 속 가짜 트리거 #agent/todo',
   '```',
@@ -37,7 +39,15 @@ symlinkSync(outside, path.join(vault, 'work', 'tunnel'));
 mkdirSync(path.join(vault, 'work', 'kept'), { recursive: true });
 symlinkSync(path.join(vault, 'work', 'kept'), path.join(vault, 'work', 'inlink'));
 
-const ENV = { VAULT_PATH: vault, WRITE_ROOTS: 'fleeting,work', DELETE_ROOTS: 'work', MARK_VALUES: '/,!' };
+const ENV = {
+  VAULT_PATH: vault,
+  READ_ROOTS: '.',
+  WRITE_ROOTS: 'fleeting,work',
+  DELETE_ROOTS: 'work',
+  TODO_SELECTOR: '#agent/todo',
+  TODO_MARKS: 'waiting=~,succeeded=/,failed=!',
+  TODO_WRITE: '1',
+};
 const srv = startServer(SERVER, ENV);
 await new Promise(r => setTimeout(r, 300));
 
@@ -45,22 +55,18 @@ try {
   // initialize / tools list
   const init = await srv.rpc('initialize', { protocolVersion: '2025-03-26' });
   check('initialize', init.result?.serverInfo?.name === 'vault-workspace-mcp');
-  check('version is 0.3.0', init.result?.serverInfo?.version === '0.3.0', init.result?.serverInfo?.version);
+  check('version is 0.4.0', init.result?.serverInfo?.version === '0.4.0', init.result?.serverInfo?.version);
   const list = await srv.rpc('tools/list', {});
   const names = (list.result?.tools || []).map(t => t.name).sort();
-  check('tool surface = 6 canonical tools (v0.3 adds vault_delete)',
-    JSON.stringify(names) === JSON.stringify(['todo_mark', 'todo_query', 'vault_delete', 'vault_read', 'vault_search', 'vault_write'].sort()),
+  check('tool surface = 6 scoped tools',
+    JSON.stringify(names) === JSON.stringify(['todo_transition', 'todo_query', 'vault_delete', 'vault_read', 'vault_search', 'vault_write'].sort()),
     names.join(','));
-  const markSchema = (list.result?.tools || []).find(t => t.name === 'todo_mark');
-  check('todo_mark advertises the configured marks',
-    JSON.stringify(markSchema?.inputSchema?.properties?.mark?.enum) === JSON.stringify(['/', '!']));
 
   // todo_query: open only, fence skipped, configured marks excluded from "open"
   let r = await srv.callTool('todo_query', { folder: 'initiatives' });
   check('todo_query finds exactly 2 open tagged todos', r.data?.count === 2, JSON.stringify(r.data?.rows));
-  check('todo_query returns file·line', r.data?.rows?.[0]?.file === path.join('initiatives', 'sub-a.md') && r.data?.rows?.[0]?.line === 2);
-  r = await srv.callTool('todo_query', { folder: 'initiatives', status: 'agent_finished' });
-  check('todo_query: configured mark = agent_finished', r.data?.count === 1 && r.data?.rows?.[0]?.mark === '/');
+  check('todo_query returns file·line·fingerprint', r.data?.rows?.[0]?.file === path.join('initiatives', 'sub-a.md') && r.data?.rows?.[0]?.line === 2 && /^[a-f0-9]{64}$/.test(r.data?.rows?.[0]?.fingerprint || ''));
+  const firstTodo = r.data.rows[0];
 
   // vault_search: folder required; query hits
   r = await srv.callTool('vault_search', {});
@@ -71,6 +77,8 @@ try {
   // vault_read paging
   r = await srv.callTool('vault_read', { file: 'initiatives/sub-a.md', offset: 2, limit: 1 });
   check('vault_read paging', r.data?.returned_lines === 1 && r.data?.text.includes('수집 작업'));
+  r = await srv.callTool('vault_read', { file: '.claude/secret.md' });
+  check('vault_read enforces READ_DENIES on direct reads', r.isError && r.text.includes('READ_DENIES'), r.text);
 
   // vault_write: create / no-silent-overwrite / append / traversal & .obsidian rejection
   r = await srv.callTool('vault_write', { file: 'work/w-1/note.md', content: 'hello' });
@@ -88,38 +96,70 @@ try {
   r = await srv.callTool('vault_write', { file: 'fleeting/idea.md', content: 'inside wall' });
   check('write inside WRITE_ROOTS (fleeting) allowed', r.data?.ok === true);
   r = await srv.callTool('vault_write', { file: 'initiatives/sub-a.md', content: 'x', mode: 'append' });
-  check('write outside WRITE_ROOTS denied', r.isError && r.text.includes('write surface'), r.text);
+  check('write outside WRITE_ROOTS denied', r.isError && r.text.includes('WRITE_ROOTS'), r.text);
   r = await srv.callTool('vault_write', { file: 'worknote.md', content: 'x' });
   check('prefix trick (worknote vs work/) denied', r.isError, r.text);
 
-  // v0.3: a symlink under the write root must not tunnel out of the vault
+  // a symlink under the write root must not tunnel out of the vault
   r = await srv.callTool('vault_write', { file: 'work/tunnel/pwned.md', content: 'x' });
   check('write through an out-of-vault symlink denied', r.isError && r.text.includes('link'), r.text);
   check('  ... and nothing was written outside', !existsSync(path.join(outside, 'pwned.md')));
 
-  // todo_mark: configured marks, both outcomes, idempotency, user-only values refused
-  r = await srv.callTool('todo_mark', { file: 'initiatives/sub-a.md', line: 2 });
-  check('todo_mark requires an explicit mark when several are configured', r.isError, r.text);
-  r = await srv.callTool('todo_mark', { file: 'initiatives/sub-a.md', line: 2, mark: '/' });
-  check('todo_mark writes the accepted mark', r.data?.ok === true && r.data?.new?.includes('[/]'));
-  r = await srv.callTool('todo_mark', { file: 'initiatives/sub-a.md', line: 2, mark: '/' });
-  check('todo_mark is idempotent', r.data?.unchanged === true);
-  r = await srv.callTool('todo_mark', { file: 'initiatives/sub-a.md', line: 9, mark: '!' });
-  check('todo_mark writes the failed mark too', r.data?.ok === true && r.data?.new?.includes('[!]'));
-  r = await srv.callTool('todo_query', { folder: 'initiatives' });
-  check('both marked todos leave the open set', r.data?.count === 0, JSON.stringify(r.data?.rows));
-  r = await srv.callTool('todo_mark', { file: 'initiatives/sub-a.md', line: 2, mark: 'x' });
-  check("todo_mark refuses '[x]' (user's final confirmation)", r.isError && r.text.includes('final confirmation'), r.text);
-  r = await srv.callTool('todo_mark', { file: 'initiatives/sub-a.md', line: 2, mark: ' ' });
-  check("todo_mark refuses '[ ]' (re-open is the user's)", r.isError, r.text);
-  r = await srv.callTool('todo_mark', { file: 'initiatives/sub-a.md', line: 3, mark: '/' });
-  check('todo_mark refuses an already-[x] line', r.data?.ok === false && /final confirmation/.test(r.data?.error || ''), JSON.stringify(r.data));
-  r = await srv.callTool('todo_mark', { file: 'initiatives/sub-a.md', line: 6, mark: '/' });
-  check('todo_mark refuses a line inside a fence', r.data?.ok === false && /fenced/.test(r.data?.error || ''), JSON.stringify(r.data));
-  r = await srv.callTool('todo_mark', { file: 'initiatives/sub-a.md', line: 8, mark: '/' });
-  check('todo_mark refuses non-checkbox line', r.data?.ok === false);
+  // todo_transition: fingerprint lookup, waiting/final states, idempotency, conflict
+  r = await srv.callTool('todo_transition', {
+    file: firstTodo.file, fingerprint: firstTodo.fingerprint, state: 'waiting', work_id: 'w-test-0001',
+    question: '범위를 확인해 주세요', work_link: '[[work/w-test-0001/work.md]]',
+  });
+  check('todo_transition records waiting state', r.data?.state === 'waiting' && r.data?.mark === '~');
+  let todoText = readFileSync(path.join(vault, firstTodo.file), 'utf8');
+  check('waiting transition writes question and work link atomically', todoText.includes('[~] 수집 작업') && todoText.includes('질문: 범위를 확인해 주세요') && todoText.includes('작업: [[work/w-test-0001/work.md]]'));
+  r = await srv.callTool('todo_transition', {
+    file: firstTodo.file, fingerprint: firstTodo.fingerprint, state: 'waiting', work_id: 'w-test-0001',
+    question: '범위를 확인해 주세요', work_link: '[[work/w-test-0001/work.md]]',
+  });
+  check('todo_transition is idempotent', r.data?.unchanged === true);
 
-  // v0.3 vault_delete: the gates' cleanup surface, walled separately
+  appendFileSync(path.join(vault, firstTodo.file), '\n  - Vault Steward: w-test-0001\n    - 결과: [[duplicate]]');
+  r = await srv.callTool('todo_transition', {
+    file: firstTodo.file, fingerprint: firstTodo.fingerprint, state: 'waiting', work_id: 'w-test-0001',
+    question: '범위를 확인해 주세요', work_link: '[[work/w-test-0001/work.md]]',
+  });
+  check('duplicate work blocks fail closed', r.isError && /source_conflict/.test(r.text), r.text);
+  const duplicateFile = readFileSync(path.join(vault, firstTodo.file), 'utf8');
+  writeFileSync(path.join(vault, firstTodo.file), duplicateFile.replace(/\n  - Vault Steward: w-test-0001\n    - 결과: \[\[duplicate\]\]$/, ''));
+  r = await srv.callTool('todo_query', { folder: 'initiatives' });
+  check('waiting todo leaves the Dispatcher query', r.data?.count === 1, JSON.stringify(r.data?.rows));
+
+  // Simulate user input: user owns the reset from [~] to [ ]. The source fingerprint remains stable.
+  writeFileSync(path.join(vault, firstTodo.file), todoText.replace('[~] 수집 작업', '[ ] 수집 작업'));
+  r = await srv.callTool('todo_transition', {
+    file: firstTodo.file, fingerprint: firstTodo.fingerprint, state: 'succeeded', work_id: 'w-test-0001',
+    result_link: '[[work/w-test-0001/result.md]]',
+  });
+  check('succeeded transition uses configured mark', r.data?.state === 'succeeded' && r.data?.mark === '/');
+  todoText = readFileSync(path.join(vault, firstTodo.file), 'utf8');
+  check('final transition replaces the waiting block with result link', todoText.includes('[/] 수집 작업') && todoText.includes('결과: [[work/w-test-0001/result.md]]') && !todoText.includes('질문:'));
+
+  r = await srv.callTool('todo_query', { folder: 'initiatives' });
+  const secondTodo = r.data.rows[0];
+  const beforeEdit = readFileSync(path.join(vault, secondTodo.file), 'utf8');
+  writeFileSync(path.join(vault, secondTodo.file), beforeEdit.replace('실패로 닫을 일', '사용자가 고친 실패 작업'));
+  r = await srv.callTool('todo_transition', {
+    file: secondTodo.file, fingerprint: secondTodo.fingerprint, state: 'failed', work_id: 'w-test-0002',
+    result_link: '[[work/w-test-0002/work.md]]',
+  });
+  check('source edit causes source_conflict', r.isError && r.text.includes('source_conflict'), r.text);
+  r = await srv.callTool('todo_query', { folder: 'initiatives' });
+  const editedTodo = r.data.rows[0];
+  r = await srv.callTool('todo_transition', {
+    file: editedTodo.file, fingerprint: editedTodo.fingerprint, state: 'failed', work_id: 'w-test-0002',
+    result_link: '[[work/w-test-0002/work.md]]',
+  });
+  check('failed transition uses configured mark', r.data?.state === 'failed' && r.data?.mark === '!');
+  r = await srv.callTool('todo_query', { folder: 'initiatives' });
+  check('all transitioned todos leave the open set', r.data?.count === 0, JSON.stringify(r.data?.rows));
+
+  // vault_delete: the gates' cleanup surface, walled separately
   r = await srv.callTool('vault_write', { file: 'work/w-2/probe.tmp', content: 'probe' });
   check('write probe created', r.data?.ok === true);
   r = await srv.callTool('vault_delete', { path: 'work/w-2/probe.tmp' });
@@ -134,7 +174,7 @@ try {
   check('  ... folder is gone from disk', !existsSync(path.join(vault, 'work', 'w-1')));
   r = await srv.callTool('vault_delete', { path: 'fleeting/idea.md' });
   check('delete denied outside DELETE_ROOTS (write surface is not a delete surface)',
-    r.isError && r.text.includes('delete surface'), r.text);
+    r.isError && r.text.includes('DELETE_ROOTS'), r.text);
   check('  ... the fleeting note survives', existsSync(path.join(vault, 'fleeting', 'idea.md')));
   r = await srv.callTool('vault_delete', { path: 'work', recursive: true });
   check('delete refuses a delete root itself', r.isError && r.text.includes('root itself'), r.text);
@@ -174,25 +214,36 @@ async function expectExit(label, env, needle) {
 
 const vault2 = mkdtempSync(path.join(tmpdir(), 'vws-cfg-'));
 try {
-  await expectExit('refuses to start without MARK_VALUES',
-    { VAULT_PATH: vault2, WRITE_ROOTS: '*' }, 'MARK_VALUES env var is required');
+  await expectExit('refuses to start without TODO_MARKS',
+    { VAULT_PATH: vault2, WRITE_ROOTS: '*' }, 'TODO_MARKS is required');
   await expectExit("refuses 'x' as a configured mark",
-    { VAULT_PATH: vault2, WRITE_ROOTS: '*', MARK_VALUES: '/,x' }, "final confirmation");
+    { VAULT_PATH: vault2, TODO_MARKS: 'waiting=~,succeeded=x,failed=!' }, "final confirmation");
   await expectExit('refuses a multi-character mark',
-    { VAULT_PATH: vault2, WRITE_ROOTS: '*', MARK_VALUES: '//' }, 'single characters');
+    { VAULT_PATH: vault2, TODO_MARKS: 'waiting=~~,succeeded=/,failed=!' }, 'invalid TODO_MARKS');
 
-  // no DELETE_ROOTS -> no delete tool at all (absence visible in tools/list)
-  const s = startServer(SERVER, { VAULT_PATH: vault2, WRITE_ROOTS: '*', MARK_VALUES: '/' });
+  // Read-only instance exposes no mutation tools.
+  const s = startServer(SERVER, { VAULT_PATH: vault2, TODO_MARKS: 'waiting=~,succeeded=/,failed=!' });
   await new Promise(r => setTimeout(r, 300));
   const l = await s.rpc('tools/list', {});
   const n = (l.result?.tools || []).map(t => t.name);
   check('without DELETE_ROOTS the delete tool is not registered', !n.includes('vault_delete'), n.join(','));
+  check('without write scope vault_write is not registered', !n.includes('vault_write'), n.join(','));
+  check('without TODO_WRITE todo_transition is not registered', !n.includes('todo_transition'), n.join(','));
   const call = await s.callTool('vault_delete', { path: 'anything' });
   check('  ... and calling it is an unknown tool', call.isError && call.text.includes('unknown tool'), call.text);
-  const single = await s.callTool('todo_mark', { file: 'x.md', line: 1 });
-  check('with one configured mark, mark may be omitted (fails later on the missing file)',
-    single.isError && !single.text.includes('mark is required'), single.text);
   s.kill();
+
+  mkdirSync(path.join(vault2, 'work'), { recursive: true });
+  const scoped = startServer(SERVER, {
+    VAULT_PATH: vault2, WRITE_PATHS: 'work/exact.md',
+    TODO_MARKS: 'waiting=~,succeeded=/,failed=!',
+  });
+  await new Promise(r => setTimeout(r, 300));
+  let q = await scoped.callTool('vault_write', { file: 'work/exact.md', content: 'ok' });
+  check('WRITE_PATHS permits the exact assignment path', q.data?.ok === true);
+  q = await scoped.callTool('vault_write', { file: 'work/sibling.md', content: 'no' });
+  check('WRITE_PATHS denies a sibling path', q.isError && q.text.includes('WRITE_PATHS'), q.text);
+  scoped.kill();
 } finally {
   rmSync(vault2, { recursive: true, force: true });
 }

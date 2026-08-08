@@ -7,34 +7,39 @@ Zero-dependency stdio MCP server for agent work in an Obsidian vault.
 | Tool | What it does |
 |---|---|
 | `vault_search(folder, query?, name_pattern?, limit?)` | Folder scope **required** — full-vault scans are not offered |
-| `vault_read(file, offset?, limit?)` | Paged read |
-| `vault_write(file, content, mode?)` | create / overwrite / append — walled by `WRITE_ROOTS` |
-| `vault_delete(path, recursive?)` | Cleanup — walled by `DELETE_ROOTS`, **absent** when unconfigured |
-| `todo_query(folder?, tag?, status?, limit?)` | Precise checkbox-line search; fenced blocks skipped; returns `file`·`line`·`mark` |
-| `todo_mark(file, line, mark?)` | Sets one of `MARK_VALUES`; idempotent |
+| `vault_read(file, offset?, limit?)` | Paged read under `READ_ROOTS`, excluding `READ_DENIES` |
+| `vault_write(file, content, mode?)` | Scoped create or atomic replace; absent without a write scope |
+| `vault_delete(path, recursive?)` | Exact/rooted delete; absent without a delete scope |
+| `todo_query(folder?, limit?)` | Only open exact-selector Todos; returns source fingerprint |
+| `todo_transition(...)` | Gate-only conditional waiting/success/failure transition; absent unless enabled |
 
 **Config (env)**
 
 | Var | Required | Meaning |
 |---|---|---|
 | `VAULT_PATH` | ✅ | Absolute path to the vault root |
-| `WRITE_ROOTS` | ✅ | Comma-separated vault-relative write surface (`*` disables the wall — tests only) |
-| `MARK_VALUES` | ✅ | Comma-separated checkbox chars, one per outcome (e.g. `/,!`) |
-| `DELETE_ROOTS` | — | Delete surface. Unset ⇒ `vault_delete` is not registered at all |
+| `READ_ROOTS` | — | Read roots; default `.` |
+| `READ_DENIES` | — | Denied paths; defaults to Vault control, trash, agent config, and all `.git` paths |
+| `WRITE_ROOTS` / `WRITE_PATHS` | — | Rooted or exact write scope; no scope ⇒ no `vault_write` |
+| `DELETE_ROOTS` / `DELETE_PATHS` | — | Rooted or exact delete scope; no scope ⇒ no `vault_delete` |
+| `TODO_SELECTOR` | — | Exact same-line tag token; default `#agent/todo` |
+| `TODO_MARKS` | ✅ | `waiting=~,succeeded=/,failed=!` form; values must be distinct |
+| `TODO_WRITE` | — | `1` exposes Gate-only `todo_transition` |
 
-**Run**: `VAULT_PATH=/path/to/vault WRITE_ROOTS=fleeting,work MARK_VALUES=/,! node server.mjs` — speaks line-delimited JSON-RPC (MCP) on stdio.
+Host adapters should start separate instances with the minimum tool surface. A Worker instance normally receives exact `READ_ROOTS`/`WRITE_PATHS`; only the Gate instance receives `TODO_WRITE=1` or finalization targets.
 
 ## Boundaries by design
 
-- **Delete is walled separately from write.** The gates need cleanup — removing a write probe, a half-made work folder (left behind, it blocks its source as a duplicate forever), a failed artifact — but a write surface is not automatically a delete surface. A delete root itself cannot be deleted, folders need `recursive: true`, and an absent target returns `ok` with `unchanged: true`.
-- **`[x]` and `[ ]` are the user's.** `todo_mark` writes only the configured `MARK_VALUES`; the final confirmation and the re-open are refused unconditionally, not by config, and an already-`[x]` line is never overwritten. `MARK_VALUES` is required — a silent default would let a deployment close both outcomes with the same mark and never notice.
-- **Marks configure the trigger query too.** `status:"open"` never returns a todo this deployment has already marked — otherwise the same todo is re-discovered forever.
-- **Fenced blocks are not triggers.** Both `todo_query` and `todo_mark` skip them: example todos in policy notes are examples.
-- **Walls are checked on real paths.** Vault-relative only; absolute paths and `..` are rejected; the resolved path must stay inside the vault, so a symlink cannot tunnel a write or a delete out of a root. `vault_delete` refuses symlinks outright.
+- **Reads are walled too.** Direct reads and recursive search both enforce `READ_DENIES`; a caller cannot bypass a denied folder by naming a file directly.
+- **Exact assignment paths are supported.** `WRITE_PATHS` and `DELETE_PATHS` avoid widening a Worker or one-shot Gate operation to a whole folder.
+- **Todo selection is fixed by configuration.** Callers cannot disable the selector or request non-open states. Partial tag matches and fenced examples are excluded.
+- **Todo effects are conditional and atomic.** `todo_transition` re-finds exactly one source fingerprint, fails closed on user edits, and writes the mark plus question/work or result record in one replacement. `[x]` remains user-owned.
+- **Walls use real paths.** Absolute paths, traversal, denied paths, and symlink escape are rejected. Root deletion and symlink deletion are refused.
 - `.obsidian/` is not a work area.
 - Scoring and gate logic are intentionally absent — this is an I/O capability layer for a gated workflow. Verdicts and state transitions belong to the gate core.
 
 ## History
 
+- **v0.4** — read roots/denies, exact assignment paths, optional mutation surfaces, atomic replacement, exact Todo selector, source fingerprints, and Gate-only semantic transitions.
 - **v0.3** — `vault_delete` + `DELETE_ROOTS`; `MARK_VALUES` (one mark per outcome) replaces the hard-coded `/`; symlink escape closed for write and delete; `todo_mark` refuses fenced and already-`[x]` lines.
 - **v0.2** — `workspace_lock_*` removed (duplicate detection is the prepare gate's job, not a mutex); `WRITE_ROOTS` wall moved into the server, out of hooks.
