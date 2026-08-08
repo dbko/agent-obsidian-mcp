@@ -1,12 +1,13 @@
 # paper-fetch-mcp
 
-Zero-dependency stdio MCP server that fetches arXiv paper full text for grounded reading.
+Zero-dependency stdio MCP server that resolves arXiv, DOI, or OpenAlex work IDs to open full text for grounded reading.
 
-**Tool**: `paper_fulltext_fetch(arxiv_id, include_references?, max_chars?)` → `{ arxiv_id, source: 'ar5iv'|'pdf', title, chars, truncated, text }`
+**Tool**: `paper_fulltext_fetch(paper_id, include_references?, offset_line?, limit_lines?)`
 
-- Tries ar5iv HTML first — LaTeX math preserved as `$…$` (from `<math alttext>`), tables kept as markdown.
-- Falls back to the arXiv PDF via `pdftotext -layout` (requires poppler-utils).
-- Bibliography stripped by default; output length capped (default 40 000 chars).
-- No API key, no rate limit; caller should verify the returned title matches the intended paper.
+- arXiv uses ar5iv first and PDF fallback. DOI/OpenAlex IDs resolve metadata and use an arXiv location, OA PDF, or full-article HTML.
+- Returns canonical identifiers, source URL, metadata, whole-content SHA-256, total lines, and globally numbered paged text.
+- Read successive pages while `has_more` is true before treating the paper as fully read.
+- Bibliography is omitted by default. Figures are not evidence unless represented in extracted text.
+- DOI and OpenAlex resolution use public network services; no secret is logged.
 
 **Run**: `node server.mjs` — speaks line-delimited JSON-RPC (MCP) on stdio. Runtime deps: Node ≥ 18, `pdftotext`.

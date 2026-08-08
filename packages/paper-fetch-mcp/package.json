@@ -1,7 +1,7 @@
 {
   "name": "paper-fetch-mcp",
-  "version": "0.1.0",
-  "description": "Zero-dependency stdio MCP server: fetch arXiv paper full text with LaTeX math preserved (ar5iv HTML first, arXiv PDF via pdftotext fallback). Single tool: paper_fulltext_fetch.",
+  "version": "0.2.0",
+  "description": "Resolve arXiv, DOI, or OpenAlex IDs to paged open full text with stable evidence locators.",
   "license": "MIT",
   "type": "module",
   "main": "server.mjs",
@@ -18,6 +18,8 @@
   "keywords": [
     "mcp",
     "arxiv",
+    "doi",
+    "openalex",
     "agent"
   ]
 }

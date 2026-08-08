@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-// paper-fetch-mcp — zero-dependency stdio MCP server: fetch arXiv paper full text (LaTeX math preserved).
+// paper-fetch-mcp — zero-dependency stdio MCP server: resolve arXiv/DOI/OpenAlex IDs
+// to open full text and return paged, stable line locators.
 //
 // Tool (canonical name per workflow capability registry):
-//   paper_fulltext_fetch(arxiv_id, include_references?, max_chars?)
-//     -> { arxiv_id, source: 'ar5iv'|'pdf', title, chars, truncated, text }
+//   paper_fulltext_fetch(paper_id, include_references?, offset_line?, limit_lines?)
+//     -> identifiers + metadata + source URL + content digest + globally numbered lines
 //
 // Strategy per call:
 //   1. ar5iv HTML (https://ar5iv.labs.arxiv.org/html/{id}) -> text + LaTeX from <math alttext>
@@ -13,31 +14,45 @@
 // Runtime dependencies: node >= 18, pdftotext (poppler-utils) for the PDF fallback.
 // Node built-ins only. stdout is reserved for JSON-RPC frames; logs go to stderr.
 
+import http from 'node:http';
 import https from 'node:https';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 
 const PROTOCOL = '2025-03-26';
 const SERVER_NAME = 'paper-fetch-mcp';
-const SERVER_VERSION = '0.1.0';
-const DEFAULT_MAX_CHARS = 40000;
+const SERVER_VERSION = '0.2.0';
+const DEFAULT_LIMIT_LINES = 500;
 const HTTP_TIMEOUT_MS = 45000;
 
 const log = (...a) => process.stderr.write(a.join(' ') + '\n');
 
-// --- arxiv id normalize -----------------------------------------------------
-// Accepts "2309.16653", "arXiv:2309.16653", "2309.16653v2", full URLs. Strips version suffix.
-function normalizeId(raw) {
-  if (!raw || typeof raw !== 'string') throw new Error('arxiv_id is required (e.g. "2309.16653")');
+// --- identifier normalize --------------------------------------------------
+function normalizeArxivId(raw) {
   const s = raw.trim();
   const m = s.match(/(\d{4}\.\d{4,5})(v\d+)?/) || s.match(/([a-z\-]+(?:\.[A-Z]{2})?\/\d{7})(v\d+)?/i);
-  if (!m) throw new Error(`unrecognized arxiv id: ${raw}`);
-  return m[1];
+  return m ? m[1] : null;
+}
+
+function parsePaperId(raw) {
+  if (!raw || typeof raw !== 'string')
+    throw new Error('paper_id is required (arXiv ID, DOI, or OpenAlex work ID)');
+  const value = raw.trim();
+  const openalex = value.match(/(?:https?:\/\/openalex\.org\/)?(W\d+)$/i);
+  if (openalex) return { kind: 'openalex', value: openalex[1].toUpperCase() };
+  const doi = value.replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, '').replace(/^doi:\s*/i, '');
+  if (/^10\.\d{4,9}\/\S+$/i.test(doi)) return { kind: 'doi', value: doi };
+  const arxiv = normalizeArxivId(value);
+  if (arxiv && (/arxiv/i.test(value) || /^\d{4}\.\d{4,5}(v\d+)?$/.test(value) || /^[a-z\-]+(?:\.[A-Z]{2})?\/\d{7}(v\d+)?$/i.test(value)))
+    return { kind: 'arxiv', value: arxiv };
+  throw new Error(`unrecognized paper_id: ${raw}`);
 }
 
 // --- HTTP GET with redirect follow (text or binary) -------------------------
 function httpGet(url, { binary = false, redirects = 5 } = {}) {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, { timeout: HTTP_TIMEOUT_MS, headers: { 'User-Agent': `${SERVER_NAME}/${SERVER_VERSION}` } }, (res) => {
+    const transport = new URL(url).protocol === 'http:' ? http : https;
+    const req = transport.get(url, { timeout: HTTP_TIMEOUT_MS, headers: { 'User-Agent': `${SERVER_NAME}/${SERVER_VERSION}`, 'Accept-Encoding': 'identity' } }, (res) => {
       const { statusCode, headers } = res;
       if (statusCode >= 300 && statusCode < 400 && headers.location && redirects > 0) {
         res.resume();
@@ -48,7 +63,7 @@ function httpGet(url, { binary = false, redirects = 5 } = {}) {
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => {
         const buf = Buffer.concat(chunks);
-        resolve({ status: statusCode, body: binary ? buf : buf.toString('utf8') });
+        resolve({ status: statusCode, headers, url, body: binary ? buf : buf.toString('utf8') });
       });
     });
     req.on('error', reject);
@@ -138,52 +153,175 @@ function stripReferences(text) {
   return last > text.length * 0.4 ? text.slice(0, last).trimEnd() : text;
 }
 
-async function paperFulltextFetch({ arxiv_id, include_references = false, max_chars = DEFAULT_MAX_CHARS } = {}) {
-  const id = normalizeId(arxiv_id);
-  const cap = Math.max(2000, Math.min(120000, Number(max_chars) || DEFAULT_MAX_CHARS));
-  let source, title = '', text = '';
+function normalizeText(text, includeReferences) {
+  let value = includeReferences ? text : stripReferences(text);
+  value = value.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  return value.split('\n').map((line) => line.trimEnd()).filter((line) => line.trim().length > 0);
+}
+
+async function resolveOpenAlex(parsed) {
+  const lookup = parsed.kind === 'doi' ? `doi:${parsed.value}` : parsed.value;
+  const url = `https://api.openalex.org/works/${lookup}`;
+  const r = await httpGet(url);
+  if (r.status === 404 && parsed.kind === 'doi') return null;
+  if (r.status !== 200) throw new Error(`OpenAlex resolution failed (${r.status}) for ${parsed.value}`);
+  let work;
+  try { work = JSON.parse(r.body); }
+  catch { throw new Error('OpenAlex returned invalid JSON'); }
+
+  const locations = [work.best_oa_location, work.primary_location, ...(work.locations || [])].filter(Boolean);
+  let arxiv = null;
+  for (const loc of locations) {
+    const joined = `${loc.landing_page_url || ''} ${loc.pdf_url || ''}`;
+    arxiv ||= normalizeArxivId(joined);
+  }
+  const pdfUrls = [...new Set(locations.map((loc) => loc.pdf_url).filter(Boolean))];
+  const landingUrls = [...new Set(locations.map((loc) => loc.landing_page_url).filter(Boolean))];
+  return {
+    metadata: {
+      title: work.title || '',
+      year: work.publication_year || null,
+      authors: (work.authorships || []).map((a) => a.author?.display_name).filter(Boolean),
+    },
+    identifiers: {
+      openalex: (work.id || '').replace(/^https?:\/\/openalex\.org\//i, '') || null,
+      doi: (work.doi || '').replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, '') || (parsed.kind === 'doi' ? parsed.value : null),
+      arxiv,
+    },
+    pdfUrls,
+    landingUrls,
+  };
+}
+
+async function fetchArxiv(id) {
+  let title = '', text = '';
 
   try {
     const r = await httpGet(`https://ar5iv.labs.arxiv.org/html/${id}`);
     if (r.status === 200 && r.body && /<math|ltx_page_content|ltx_document/i.test(r.body)) {
       const parsed = ar5ivToText(r.body);
-      if (parsed.text && parsed.text.length > 500) { source = 'ar5iv'; title = parsed.title; text = parsed.text; }
+      if (parsed.text && parsed.text.length > 500)
+        return { source: 'ar5iv', source_url: `https://ar5iv.labs.arxiv.org/html/${id}`, title: parsed.title, text: parsed.text };
     }
   } catch (e) { log('ar5iv failed:', e.message); }
 
-  if (!text) {
+  const sourceUrl = `https://arxiv.org/pdf/${id}`;
+  const r = await httpGet(sourceUrl, { binary: true });
+  if (r.status === 200 && r.body && r.body.length > 1000) {
+    text = await pdftotext(r.body);
+    if (text.length > 300) return { source: 'pdf', source_url: sourceUrl, title, text };
+  }
+  throw new Error(`could not fetch arXiv ${id} from ar5iv or PDF`);
+}
+
+async function fetchOpenPdf(urls) {
+  for (const url of urls) {
     try {
-      const r = await httpGet(`https://arxiv.org/pdf/${id}`, { binary: true });
-      if (r.status === 200 && r.body && r.body.length > 1000) {
-        let t = await pdftotext(r.body);
-        if (!include_references) t = stripReferences(t);
-        t = t.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
-        if (t.length > 300) { source = 'pdf'; text = t; }
+      const parsed = new URL(url);
+      if (!['http:', 'https:'].includes(parsed.protocol)) continue;
+      const r = await httpGet(parsed.toString(), { binary: true });
+      const contentType = String(r.headers?.['content-type'] || '').toLowerCase();
+      if (r.status !== 200 || !r.body || r.body.length < 1000) continue;
+      if (!contentType.includes('pdf') && r.body.subarray(0, 5).toString() !== '%PDF-') continue;
+      const text = await pdftotext(r.body);
+      if (text.length > 300) return { source: 'oa-pdf', source_url: parsed.toString(), title: '', text };
+    } catch (e) { log('OA PDF failed:', e.message); }
+  }
+  throw new Error('no retrievable open-access PDF was found');
+}
+
+async function fetchDoiOrOpenHtml(doi, urls = []) {
+  const candidates = [...new Set([...(doi ? [`https://doi.org/${doi}`] : []), ...urls])];
+  for (const url of candidates) {
+    try {
+      const r = await httpGet(url);
+      if (r.status !== 200 || !r.body) continue;
+      const arxiv = normalizeArxivId(`${r.url || ''} ${r.body.slice(0, 5000)}`);
+      if (arxiv) return { arxiv, fetched: await fetchArxiv(arxiv) };
+      const fulltextSignal = /<article\b|article[-_ ]body|full[-_ ]text|citation_pdf_url/i.test(r.body);
+      if (!fulltextSignal) continue;
+      const parsed = ar5ivToText(r.body);
+      if (parsed.text.length > 5000)
+        return { arxiv: null, fetched: { source: 'oa-html', source_url: r.url || url, title: parsed.title, text: parsed.text } };
+    } catch (e) { log('DOI/OA HTML failed:', e.message); }
+  }
+  throw new Error('DOI/OpenAlex metadata did not lead to retrievable open full text');
+}
+
+async function paperFulltextFetch({ paper_id, include_references = false, offset_line = 1, limit_lines = DEFAULT_LIMIT_LINES } = {}) {
+  const parsed = parsePaperId(paper_id);
+  let metadata = { title: '', year: null, authors: [] };
+  let identifiers = { openalex: null, doi: null, arxiv: null };
+  let fetched;
+
+  if (parsed.kind === 'arxiv') {
+    identifiers.arxiv = parsed.value;
+    fetched = await fetchArxiv(parsed.value);
+    metadata.title = fetched.title;
+  } else {
+    const resolved = await resolveOpenAlex(parsed);
+    if (resolved) {
+      metadata = resolved.metadata;
+      identifiers = resolved.identifiers;
+    } else {
+      identifiers.doi = parsed.value;
+    }
+    if (identifiers.arxiv) {
+      fetched = await fetchArxiv(identifiers.arxiv);
+    } else {
+      try { fetched = await fetchOpenPdf(resolved?.pdfUrls || []); }
+      catch {
+        const fallback = await fetchDoiOrOpenHtml(identifiers.doi, resolved?.landingUrls || []);
+        if (fallback.arxiv) identifiers.arxiv = fallback.arxiv;
+        fetched = fallback.fetched;
       }
-    } catch (e) { log('pdf fallback failed:', e.message); }
+    }
+    if (!metadata.title) metadata.title = fetched.title;
   }
 
-  if (!text) throw new Error(`could not fetch ${id} from ar5iv or arxiv PDF (check the id / network)`);
+  const lines = normalizeText(fetched.text, include_references);
+  if (lines.length === 0) throw new Error('full text extraction returned no usable lines');
+  const start = Math.max(1, Number(offset_line) || 1);
+  const cap = Math.max(1, Math.min(5000, Number(limit_lines) || DEFAULT_LIMIT_LINES));
+  if (start > lines.length) throw new Error(`offset_line ${start} exceeds total_lines ${lines.length}`);
+  const selected = lines.slice(start - 1, start - 1 + cap);
+  const end = start + selected.length - 1;
+  const text = selected.map((line, i) => `[L${String(start + i).padStart(6, '0')}] ${line}`).join('\n');
+  const contentSha256 = createHash('sha256').update(lines.join('\n')).digest('hex');
 
-  let truncated = false;
-  if (text.length > cap) { text = text.slice(0, cap); truncated = true; }
-
-  return { arxiv_id: id, source, title, chars: text.length, truncated, text };
+  return {
+    requested_id: paper_id,
+    identifiers,
+    title: metadata.title,
+    year: metadata.year,
+    authors: metadata.authors,
+    source: fetched.source,
+    source_url: fetched.source_url,
+    locator_scheme: 'content_sha256 + global extracted line number',
+    content_sha256: contentSha256,
+    total_lines: lines.length,
+    offset_line: start,
+    returned_lines: selected.length,
+    end_line: end,
+    has_more: end < lines.length,
+    text,
+  };
 }
 
 // --- MCP tool registry ------------------------------------------------------
 const TOOLS = [
   {
     name: 'paper_fulltext_fetch',
-    description: "Fetch an arXiv paper's full text with LaTeX math preserved, for grounded per-paper reading. Tries ar5iv HTML first (math kept as $…$ from alttext), falls back to arXiv PDF via pdftotext. No API key, no rate limit — arXiv is the source. Bibliography stripped by default; length capped (default 40000 chars). Returns { arxiv_id, source: 'ar5iv'|'pdf', title, chars, truncated, text }. Figures are NOT included (text-only). IMPORTANT: verify the returned title matches your target paper — a mismatch means the arxiv_id was wrong; re-resolve via bibliographic search and retry.",
+    description: 'Resolve an arXiv ID, DOI, or OpenAlex work ID to retrievable open full text. Returns canonical identifiers, metadata, source URL, content digest, and paged globally numbered lines. DOI/OpenAlex resolution is metadata-only until an arXiv or open PDF source is found. Read successive pages while has_more=true before treating the paper as fully read.',
     inputSchema: {
       type: 'object',
       properties: {
-        arxiv_id: { type: 'string', description: 'arXiv id, e.g. "2309.16653" (version suffix / arXiv: prefix / full URL all accepted).' },
+        paper_id: { type: 'string', description: 'arXiv ID/URL, DOI/URL, or OpenAlex work ID/URL.' },
         include_references: { type: 'boolean', description: 'Keep the bibliography section (default false — dropped to save context).' },
-        max_chars: { type: 'number', description: 'Max characters returned (default 40000, min 2000, max 120000). Text beyond the cap is truncated with truncated=true.' },
+        offset_line: { type: 'number', description: '1-indexed global extracted line to start from (default 1).' },
+        limit_lines: { type: 'number', description: 'Lines to return (default 500, max 5000).' },
       },
-      required: ['arxiv_id'],
+      required: ['paper_id'],
     },
   },
 ];
