@@ -38,7 +38,7 @@ import https from 'node:https';
 
 const PROTOCOL = '2025-03-26';
 const SERVER_NAME = 'vault-sync-mcp';
-const SERVER_VERSION = '0.1.0';
+const SERVER_VERSION = '0.1.1';
 
 const log = (...a) => process.stderr.write(a.join(' ') + '\n');
 
@@ -258,10 +258,19 @@ async function syncRun(args) {
     plan_files_written: written,
     note: 'HTTP 204 only means the command was accepted; the plan artefact is the evidence. This server never deletes the files it exported.',
   };
-  if (plan) {
+  if (plan && dryRun) {
     out.plan_file = path.posix.join(PLAN_DIR, planFile);
     out.plan = plan;
     out.synced = plan.pending === 0;
+  } else if (plan) {
+    // On an applying run this plan is the work the run SET OUT to do — the plugin
+    // records it when the run starts. Reading `pending` off it would report "12
+    // still pending" about the very files just pushed. The outcome is a fact about
+    // the remote after the fact, so ask for a fresh look rather than infer one.
+    out.plan_file = path.posix.join(PLAN_DIR, planFile);
+    out.planned = plan;
+    out.synced = null;
+    out.confirm_with = 'sync_run { dry_run: true } — its pending count is the outcome';
   } else {
     out.reason = lastSeen
       ? `no plan generated at or after the run within ${timeoutMs}ms — ${lastSeen}`

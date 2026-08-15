@@ -68,6 +68,18 @@ parses the resulting plan.
 When no fresh plan arrives in time the call returns `completed:false` with a `reason` — it does
 not guess. An unparsable plan is an error, never "nothing pending".
 
+**An applying run reports `planned`, not `plan`.** The plugin records the plan when a run
+*starts*, so it is the work the run set out to do — not what it achieved. Reading `pending` off
+it would say "12 still pending" about the very files just pushed. So `dry_run:false` returns
+`planned`, sets `synced: null`, and names the follow-up:
+
+```jsonc
+{ "fired": "remotely-save:start-sync", "synced": null,
+  "confirm_with": "sync_run { dry_run: true } — its pending count is the outcome" }
+```
+
+The outcome is a fact about the remote after the fact. Ask for it; do not infer it.
+
 ### `sync_plan_latest(list_limit?)`
 
 Parses the newest already-exported plan. Fires nothing and reaches no network — use it to read

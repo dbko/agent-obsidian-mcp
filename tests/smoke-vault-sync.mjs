@@ -49,7 +49,7 @@ await new Promise((r) => setTimeout(r, 300));
 try {
   const init = await srv.rpc('initialize', { protocolVersion: '2025-03-26' });
   check('initialize', init.result?.serverInfo?.name === 'vault-sync-mcp');
-  check('version is 0.1.0', init.result?.serverInfo?.version === '0.1.0', init.result?.serverInfo?.version);
+  check('version is 0.1.1', init.result?.serverInfo?.version === '0.1.1', init.result?.serverInfo?.version);
 
   const list = await srv.rpc('tools/list', {});
   const names = (list.result?.tools || []).map((t) => t.name).sort();
@@ -110,6 +110,52 @@ try {
   check('unparsable plan is an error, not zero pending', r.isError && /fenced json/.test(r.text), r.text?.slice(0, 160));
 } finally {
   srv3.kill();
+}
+
+// An applying run must not report its own work list as the outcome. The plugin
+// records the plan when the run STARTS, so reading `pending` off it says "N still
+// pending" about the very files just pushed. Mock the plugin to pin the shape.
+{
+  const applyVault = await fs.mkdtemp(path.join(os.tmpdir(), 'vault-sync-apply-'));
+  await fs.mkdir(path.join(applyVault, '_debug_remotely_save'), { recursive: true });
+  const FUTURE = 4102444800000; // any fire time is at or before this, so the plan reads as fresh
+  await fs.writeFile(
+    path.join(applyVault, '_debug_remotely_save', `sync_plans_hist_exported_on_${FUTURE}.md`),
+    'Sync plans found:\n\n```json\n' +
+      JSON.stringify({
+        '/$@meta': { key: '/$@meta', sideNotes: { generateTime: FUTURE, generateTimeFmt: 'future', service: 'dropbox' } },
+        'pushed.md': { key: 'pushed.md', decision: 'local_is_created_then_push', change: true },
+      }) +
+      '\n```\n',
+  );
+  const http = await import('node:http');
+  const mock = http.createServer((_req, res) => { res.statusCode = 204; res.end(); });
+  await new Promise((r) => mock.listen(0, '127.0.0.1', r));
+  const port = mock.address().port;
+  const srv5 = startServer(SERVER, {
+    VAULT_PATH: applyVault,
+    OBSIDIAN_API_KEY: 'smoke-key',
+    OBSIDIAN_API_URL: `http://127.0.0.1:${port}`,
+    SYNC_ALLOW_APPLY: '1',
+  });
+  await new Promise((r) => setTimeout(r, 300));
+  try {
+    const r = await srv5.callTool('sync_run', { dry_run: false, timeout_ms: 20000 }, 40000);
+    check('apply run fires the real command', r.data?.fired === 'remotely-save:start-sync', r.text?.slice(0, 160));
+    check('apply run does NOT claim synced', r.data?.synced === null, JSON.stringify(r.data?.synced));
+    check('apply run reports its work list as `planned`, not `plan`',
+      !!r.data?.planned && r.data?.plan === undefined,
+      Object.keys(r.data ?? {}).join(','));
+    check('and says how to establish the outcome', /dry_run: true/.test(r.data?.confirm_with ?? ''), r.data?.confirm_with);
+
+    const d = await srv5.callTool('sync_run', { dry_run: true, timeout_ms: 20000 }, 40000);
+    check('a dry run still reports `plan` and a synced verdict',
+      !!d.data?.plan && typeof d.data?.synced === 'boolean',
+      Object.keys(d.data ?? {}).join(','));
+  } finally {
+    srv5.kill();
+    mock.close();
+  }
 }
 
 if (process.env.SMOKE_LIVE_SYNC === '1') {
