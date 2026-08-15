@@ -1,0 +1,24 @@
+{
+  "name": "vault-sync-mcp",
+  "version": "0.1.0",
+  "description": "Fire an Obsidian vault replication run and judge it by the plan artefact, for Vault Steward host adapters.",
+  "license": "MIT",
+  "type": "module",
+  "main": "server.mjs",
+  "bin": {
+    "vault-sync-mcp": "server.mjs"
+  },
+  "files": [
+    "server.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "obsidian",
+    "agent",
+    "sync"
+  ]
+}

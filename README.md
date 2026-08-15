@@ -6,8 +6,9 @@ Host Adapter implementation candidates for Vault Steward. They are reusable prim
 |---|---|---|
 | [`vault-workspace-mcp`](packages/vault-workspace-mcp/) | scoped Vault I/O · exact Todo query · `todo_transition` | Role/assignment-scoped filesystem primitive and Gate-only conditional Todo effects. |
 | [`paper-fetch-mcp`](packages/paper-fetch-mcp/) | `paper_fulltext_fetch` | arXiv/DOI/OpenAlex resolution to paged open full text with stable locators. |
+| [`vault-sync-mcp`](packages/vault-sync-mcp/) | `sync_run` · `sync_plan_latest` | Fires a vault replication run and judges it by the exported plan, not by the command's HTTP status. |
 
-Both servers are **zero-dependency single files** (Node ≥ 18 built-ins only; `paper-fetch-mcp` additionally shells out to `pdftotext` for its PDF fallback).
+All three servers are **zero-dependency single files** (Node ≥ 18 built-ins only; `paper-fetch-mcp` additionally shells out to `pdftotext` for its PDF fallback).
 
 ## Deliberate boundaries
 
@@ -18,6 +19,7 @@ These servers are I/O capability layers only. Verdicts, scoring, state transitio
 - `todo_query` returns only `[ ]` plus the configured exact selector and a source fingerprint. `todo_transition` fails closed if that source changed.
 - Paths are Vault-relative and checked on resolved real paths. Default read denies cover Vault control, trash, agent configuration, and every `.git` directory.
 - `paper_fulltext_fetch` does not treat metadata or an abstract as full text; it requires a retrievable arXiv, OA PDF, or structurally identified full-article HTML source.
+- `vault-sync-mcp` proves the replication capability by **running** the command rather than by reading the plugin's (obfuscated) settings, treats HTTP 204 as acceptance rather than completion, walls applying separately from planning, and deletes nothing it exported.
 
 ## Develop
 
@@ -53,4 +55,11 @@ vault-workspace:
 paper-fetch:
   command: node
   args: [<install path>/node_modules/paper-fetch-mcp/server.mjs]
+vault-sync:
+  command: node
+  args: [<install path>/node_modules/vault-sync-mcp/server.mjs]
+  env:
+    VAULT_PATH: /absolute/path/to/vault
+    OBSIDIAN_API_KEY: <Local REST API key>
+    SYNC_ALLOW_APPLY: "0"             # only an instance permitted to replicate receives 1
 ```

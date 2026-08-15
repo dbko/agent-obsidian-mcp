@@ -1,16 +1,16 @@
 {
   "name": "agent-obsidian-mcp-monorepo",
   "private": true,
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Host-adapter MCP candidates for Vault Steward.",
   "license": "MIT",
   "workspaces": [
     "packages/*"
   ],
   "scripts": {
-    "smoke": "node tests/smoke-vault-workspace.mjs && node tests/smoke-paper-fetch.mjs",
+    "smoke": "node tests/smoke-vault-workspace.mjs && node tests/smoke-paper-fetch.mjs && node tests/smoke-vault-sync.mjs",
     "test": "npm run smoke",
-    "pack:all": "mkdir -p dist && npm pack --workspace packages/vault-workspace-mcp --pack-destination dist && npm pack --workspace packages/paper-fetch-mcp --pack-destination dist",
+    "pack:all": "mkdir -p dist && npm pack --workspace packages/vault-workspace-mcp --pack-destination dist && npm pack --workspace packages/paper-fetch-mcp --pack-destination dist && npm pack --workspace packages/vault-sync-mcp --pack-destination dist",
     "digest": "cd dist && sha256sum *.tgz"
   },
   "engines": {
