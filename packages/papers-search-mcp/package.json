@@ -1,0 +1,25 @@
+{
+  "name": "papers-search-mcp",
+  "version": "0.1.0",
+  "description": "Semantic search over the Hugging Face Papers corpus with a structural scope wall, for Vault Steward host adapters.",
+  "license": "MIT",
+  "type": "module",
+  "main": "server.mjs",
+  "bin": {
+    "papers-search-mcp": "server.mjs"
+  },
+  "files": [
+    "server.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "papers",
+    "huggingface",
+    "semantic-search",
+    "vault-steward"
+  ]
+}

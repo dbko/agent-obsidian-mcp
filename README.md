@@ -7,8 +7,9 @@ Host Adapter implementation candidates for Vault Steward. They are reusable prim
 | [`vault-workspace-mcp`](packages/vault-workspace-mcp/) | scoped Vault I/O · exact Todo query · `todo_transition` | Role/assignment-scoped filesystem primitive and Gate-only conditional Todo effects. |
 | [`paper-fetch-mcp`](packages/paper-fetch-mcp/) | `paper_fulltext_fetch` | arXiv/DOI/OpenAlex resolution to paged open full text with stable locators. |
 | [`vault-sync-mcp`](packages/vault-sync-mcp/) | `sync_run` · `sync_plan_latest` | Fires a vault replication run and judges it by the exported plan, not by the command's HTTP status. |
+| [`papers-search-mcp`](packages/papers-search-mcp/) | `paper_semantic_search` | Hugging Face Papers corpus search with a structural scope wall — the tool takes no path, URI, host, or repo argument. |
 
-All three servers are **zero-dependency single files** (Node ≥ 18 built-ins only; `paper-fetch-mcp` additionally shells out to `pdftotext` for its PDF fallback).
+All four servers are **zero-dependency single files** (Node ≥ 18 built-ins only; `paper-fetch-mcp` additionally shells out to `pdftotext` for its PDF fallback).
 
 ## Deliberate boundaries
 
