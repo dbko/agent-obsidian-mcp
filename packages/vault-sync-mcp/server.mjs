@@ -38,7 +38,7 @@ import https from 'node:https';
 
 const PROTOCOL = '2025-03-26';
 const SERVER_NAME = 'vault-sync-mcp';
-const SERVER_VERSION = '0.1.1';
+const SERVER_VERSION = '0.1.2';
 
 const log = (...a) => process.stderr.write(a.join(' ') + '\n');
 
@@ -228,9 +228,14 @@ async function syncRun(args) {
   let lastSeen = null;
 
   // The run needs a moment before it has a plan to hand out, and the export lands on
-  // disk a beat after the command returns. Neither delay is observable, so we retry.
+  // disk a beat after the command returns. Neither delay is observable, so we retry —
+  // with a doubling gap, because every export drops a file this server will not delete:
+  // a fixed cadence against a long-running sync turns the plan dir into hundreds of
+  // artefacts (measured: 769 files across one stalled run).
+  let gap = 2000;
   while (Date.now() < deadline) {
-    await sleep(2000);
+    await sleep(Math.min(gap, Math.max(1, deadline - Date.now())));
+    gap *= 2;
     try { await fire(CMD_EXPORT); } catch (e) { lastSeen = e.message; }
     await sleep(1500);
     const files = await listPlanFiles();
