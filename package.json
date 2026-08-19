@@ -1,7 +1,7 @@
 {
   "name": "agent-obsidian-mcp-monorepo",
   "private": true,
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Host-adapter MCP candidates for Vault Steward.",
   "license": "MIT",
   "workspaces": [
