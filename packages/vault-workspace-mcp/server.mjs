@@ -37,7 +37,7 @@ import path from 'node:path';
 
 const PROTOCOL = '2025-03-26';
 const SERVER_NAME = 'vault-workspace-mcp';
-const SERVER_VERSION = '0.4.1';
+const SERVER_VERSION = '0.4.2';
 
 const log = (...a) => process.stderr.write(a.join(' ') + '\n');
 
@@ -421,7 +421,8 @@ async function todoTransition({ file, fingerprint, state, work_id, question, wor
   if (!['waiting', 'succeeded', 'failed'].includes(state))
     throw new Error('state must be waiting, succeeded, or failed');
   work_id = oneLine(work_id, 'work_id');
-  if (!/^[A-Za-z0-9-]+$/.test(work_id)) throw new Error('work_id has unsafe characters');
+  // Hangul is allowed: the kernel's default work_id slug is Korean (010 — "한글 허용").
+  if (!/^[A-Za-z0-9가-힣-]+$/.test(work_id)) throw new Error('work_id has unsafe characters');
   if (state === 'waiting') {
     question = oneLine(question, 'question');
     work_link = oneLine(work_link, 'work_link');

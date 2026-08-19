@@ -1,6 +1,6 @@
 {
   "name": "vault-workspace-mcp",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Scoped Obsidian Vault I/O and fingerprinted Todo transitions for Vault Steward host adapters.",
   "license": "MIT",
   "type": "module",

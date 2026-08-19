@@ -55,7 +55,7 @@ try {
   // initialize / tools list
   const init = await srv.rpc('initialize', { protocolVersion: '2025-03-26' });
   check('initialize', init.result?.serverInfo?.name === 'vault-workspace-mcp');
-  check('version is 0.4.1', init.result?.serverInfo?.version === '0.4.1', init.result?.serverInfo?.version);
+  check('version is 0.4.2', init.result?.serverInfo?.version === '0.4.2', init.result?.serverInfo?.version);
   const list = await srv.rpc('tools/list', {});
   const names = (list.result?.tools || []).map(t => t.name).sort();
   check('tool surface = 6 scoped tools',
@@ -152,10 +152,17 @@ try {
   r = await srv.callTool('todo_query', { folder: 'initiatives' });
   const editedTodo = r.data.rows[0];
   r = await srv.callTool('todo_transition', {
-    file: editedTodo.file, fingerprint: editedTodo.fingerprint, state: 'failed', work_id: 'w-test-0002',
+    file: editedTodo.file, fingerprint: editedTodo.fingerprint, state: 'failed', work_id: 'w20260819-한글-확인',
     result_link: '[[work/w-test-0002/work.md]]',
   });
   check('failed transition uses configured mark', r.data?.state === 'failed' && r.data?.mark === '!');
+  const koreanBlock = readFileSync(path.join(vault, editedTodo.file), 'utf8');
+  check('korean work_id accepted and recorded', koreanBlock.includes('Vault Steward: w20260819-한글-확인'), koreanBlock);
+  r = await srv.callTool('todo_transition', {
+    file: editedTodo.file, fingerprint: 'a'.repeat(64), state: 'failed', work_id: 'bad id!',
+    result_link: '[[x]]',
+  });
+  check('work_id with unsafe characters rejected', r.isError && r.text.includes('unsafe'), r.text);
   r = await srv.callTool('todo_query', { folder: 'initiatives' });
   check('all transitioned todos leave the open set', r.data?.count === 0, JSON.stringify(r.data?.rows));
 

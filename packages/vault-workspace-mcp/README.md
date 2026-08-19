@@ -42,6 +42,7 @@ Host adapters should start separate instances with the minimum tool surface. A W
 
 ## History
 
+- **v0.4.2** — `work_id` accepts Hangul: the kernel's default work_id slug is Korean, and the ASCII-only guard forced ASCII detours in practice.
 - **v0.4.1** — indistinguishable duplicate todos withheld from `rows` as `ambiguous`; `todo_transition` names which conflict it hit; the read-scope wall on `todo_transition` documented.
 - **v0.4** — read roots/denies, exact assignment paths, optional mutation surfaces, atomic replacement, exact Todo selector, source fingerprints, and Gate-only semantic transitions.
 - **v0.3** — `vault_delete` + `DELETE_ROOTS`; `MARK_VALUES` (one mark per outcome) replaces the hard-coded `/`; symlink escape closed for write and delete; `todo_mark` refuses fenced and already-`[x]` lines.
