@@ -34,6 +34,29 @@ function normalizeArxivId(raw) {
   return m ? m[1] : null;
 }
 
+// Only an arXiv-hosted URL may yield an arXiv ID. normalizeArxivId's old-style
+// pattern (archive/7digits) matches any "word/7digits" substring, so applying it to
+// arbitrary OpenAlex locations turned PubMed and PMC links into fake arXiv IDs
+// (pubmed.../16060722 -> "gov/1606072"), sending open-access papers down the arXiv
+// branch and past the OA PDF sitting in the same location list.
+function arxivIdFromUrl(url) {
+  if (!url) return null;
+  let host;
+  try { host = new URL(url).hostname.toLowerCase(); }
+  catch { return null; }
+  const isArxivHost = host === 'arxiv.org' || host.endsWith('.arxiv.org')
+    || host === 'ar5iv.org' || host.endsWith('.ar5iv.org');
+  return isArxivHost ? normalizeArxivId(url) : null;
+}
+
+// arXiv's own DOI prefix carries the arXiv ID. Deriving it is a fallback for when
+// OpenAlex does not know the DOI — the DOI and OpenAlex identifiers stay on the record
+// either way, because dropping them to take a shortcut loses the citable reference.
+function arxivIdFromDoi(doi) {
+  const m = String(doi || '').match(/^10\.48550\/arxiv\.(\S+)$/i);
+  return m ? normalizeArxivId(m[1]) : null;
+}
+
 function parsePaperId(raw) {
   if (!raw || typeof raw !== 'string')
     throw new Error('paper_id is required (arXiv ID, DOI, or OpenAlex work ID)');
@@ -172,11 +195,19 @@ async function resolveOpenAlex(parsed) {
   const locations = [work.best_oa_location, work.primary_location, ...(work.locations || [])].filter(Boolean);
   let arxiv = null;
   for (const loc of locations) {
-    const joined = `${loc.landing_page_url || ''} ${loc.pdf_url || ''}`;
-    arxiv ||= normalizeArxivId(joined);
+    for (const url of [loc.landing_page_url, loc.pdf_url]) {
+      arxiv ||= arxivIdFromUrl(url);
+    }
   }
   const pdfUrls = [...new Set(locations.map((loc) => loc.pdf_url).filter(Boolean))];
-  const landingUrls = [...new Set(locations.map((loc) => loc.landing_page_url).filter(Boolean))];
+  // Only open-access locations may serve HTML full text. A closed work's landing page
+  // is the publisher's paywall, and a paywall carries <article> markup and well over
+  // 5000 characters of subscription copy — it passes every structural test while
+  // containing none of the paper.
+  const landingUrls = [...new Set(
+    locations.filter((loc) => loc.is_oa).map((loc) => loc.landing_page_url).filter(Boolean),
+  )];
+  const isOa = Boolean(work.open_access?.is_oa);
   return {
     metadata: {
       title: work.title || '',
@@ -190,6 +221,7 @@ async function resolveOpenAlex(parsed) {
     },
     pdfUrls,
     landingUrls,
+    isOa,
   };
 }
 
@@ -231,12 +263,20 @@ async function fetchOpenPdf(urls) {
 }
 
 async function fetchDoiOrOpenHtml(doi, urls = []) {
-  const candidates = [...new Set([...(doi ? [`https://doi.org/${doi}`] : []), ...urls])];
+  // Open-access locations only. doi.org always resolves to the publisher, and a
+  // publisher paywall carries <article> markup plus thousands of characters of
+  // subscription copy — it passes every structural test here while containing none
+  // of the paper. Measured on 10.1038/nature14539: the page returned was "Receive 52
+  // print issues", "Buy this article", "Purchase on SpringerLink". When the open
+  // locations yield nothing readable, refusing is the correct answer.
+  void doi;
+  const candidates = [...new Set(urls)];
   for (const url of candidates) {
     try {
       const r = await httpGet(url);
       if (r.status !== 200 || !r.body) continue;
-      const arxiv = normalizeArxivId(`${r.url || ''} ${r.body.slice(0, 5000)}`);
+      const bodyArxivUrl = (r.body.slice(0, 5000).match(/https?:\/\/(?:[a-z0-9-]+\.)*arxiv\.org\/\S+/i) || [])[0];
+      const arxiv = arxivIdFromUrl(r.url) || arxivIdFromUrl(bodyArxivUrl);
       if (arxiv) return { arxiv, fetched: await fetchArxiv(arxiv) };
       const fulltextSignal = /<article\b|article[-_ ]body|full[-_ ]text|citation_pdf_url/i.test(r.body);
       if (!fulltextSignal) continue;
@@ -266,12 +306,16 @@ async function paperFulltextFetch({ paper_id, include_references = false, offset
     } else {
       identifiers.doi = parsed.value;
     }
+    identifiers.arxiv ||= arxivIdFromDoi(identifiers.doi);
     if (identifiers.arxiv) {
       fetched = await fetchArxiv(identifiers.arxiv);
     } else {
       try { fetched = await fetchOpenPdf(resolved?.pdfUrls || []); }
       catch {
-        const fallback = await fetchDoiOrOpenHtml(identifiers.doi, resolved?.landingUrls || []);
+        const fallback = await fetchDoiOrOpenHtml(
+          resolved?.isOa ? identifiers.doi : null,
+          resolved?.landingUrls || [],
+        );
         if (fallback.arxiv) identifiers.arxiv = fallback.arxiv;
         fetched = fallback.fetched;
       }
