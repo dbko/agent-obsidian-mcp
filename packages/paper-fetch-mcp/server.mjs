@@ -21,7 +21,7 @@ import { createHash } from 'node:crypto';
 
 const PROTOCOL = '2025-03-26';
 const SERVER_NAME = 'paper-fetch-mcp';
-const SERVER_VERSION = '0.2.0';
+const SERVER_VERSION = '0.2.1';
 const DEFAULT_LIMIT_LINES = 500;
 const HTTP_TIMEOUT_MS = 45000;
 

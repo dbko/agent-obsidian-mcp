@@ -14,7 +14,7 @@ await new Promise(r => setTimeout(r, 300));
 try {
   const init = await srv.rpc('initialize', { protocolVersion: '2025-03-26' });
   check('initialize', init.result?.serverInfo?.name === 'paper-fetch-mcp');
-  check('version is 0.2.0', init.result?.serverInfo?.version === '0.2.0', init.result?.serverInfo?.version);
+  check('version is 0.2.1', init.result?.serverInfo?.version === '0.2.1', init.result?.serverInfo?.version);
 
   const list = await srv.rpc('tools/list', {});
   const names = (list.result?.tools || []).map(t => t.name);

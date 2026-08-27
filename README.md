@@ -19,7 +19,7 @@ These servers are I/O capability layers only. Verdicts, scoring, state transitio
 - `vault_search` **requires a folder scope** — full-vault scans are not offered.
 - `todo_query` returns only `[ ]` plus the configured exact selector and a source fingerprint. `todo_transition` fails closed if that source changed.
 - Paths are Vault-relative and checked on resolved real paths. Default read denies cover Vault control, trash, agent configuration, and every `.git` directory.
-- `paper_fulltext_fetch` does not treat metadata or an abstract as full text; it requires a retrievable arXiv, OA PDF, or structurally identified full-article HTML source.
+- `paper_fulltext_fetch` does not treat metadata or an abstract as full text; it requires a retrievable arXiv, OA PDF, or structurally identified full-article HTML source. HTML is read **only from locations OpenAlex marks open access** — `doi.org` is never followed, because it resolves to the publisher and a paywall page carries `<article>` markup and thousands of characters of subscription copy that pass every structural test. A paywalled work, and a green-OA work whose only open copy is a repository landing page rather than a PDF, are **refused rather than approximated**.
 - `vault-sync-mcp` proves the replication capability by **running** the command rather than by reading the plugin's (obfuscated) settings, treats HTTP 204 as acceptance rather than completion, walls applying separately from planning, and deletes nothing it exported.
 
 ## Develop
