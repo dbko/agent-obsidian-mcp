@@ -14,7 +14,7 @@ await new Promise(r => setTimeout(r, 300));
 try {
   const init = await srv.rpc('initialize', { protocolVersion: '2025-03-26' });
   check('initialize', init.result?.serverInfo?.name === 'paper-fetch-mcp');
-  check('version is 0.3.0', init.result?.serverInfo?.version === '0.3.0', init.result?.serverInfo?.version);
+  check('version is 0.3.1', init.result?.serverInfo?.version === '0.3.1', init.result?.serverInfo?.version);
 
   const list = await srv.rpc('tools/list', {});
   const names = (list.result?.tools || []).map(t => t.name);
@@ -27,6 +27,10 @@ try {
   check('bad paper_id refused', r.isError || /unrecognized/.test(r.text));
   r = await srv.callTool('fetch_paper', { paper_id: '2309.16653' });
   check('legacy tool name is gone', r.isError && /unknown tool/.test(r.text));
+  r = await srv.callTool('paper_fulltext_fetch', { paper_id: 'W1547304883', open_file: 'x.pdf' });
+  check('open_file disabled without LOCAL_DIR', r.isError && /disabled/.test(r.text));
+  r = await srv.callTool('paper_fulltext_fetch', { paper_id: 'W1547304883', open_file: '../escape.pdf' });
+  check('open_file path escape refused', r.isError && /bare file name|disabled/.test(r.text));
 
   if (process.env.SMOKE_NETWORK === '1') {
     r = await srv.callTool('paper_fulltext_fetch', { paper_id: '1706.03762', limit_lines: 20 }, 90000);

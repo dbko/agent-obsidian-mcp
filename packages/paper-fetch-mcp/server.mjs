@@ -18,14 +18,17 @@ import http from 'node:http';
 import https from 'node:https';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { readFileSync, realpathSync } from 'node:fs';
+import path from 'node:path';
 
 const PROTOCOL = '2025-03-26';
 const SERVER_NAME = 'paper-fetch-mcp';
-const SERVER_VERSION = '0.3.0';
+const SERVER_VERSION = '0.3.1';
 const DEFAULT_LIMIT_LINES = 500;
 const HTTP_TIMEOUT_MS = 45000; // socket idle — a trickling server never trips this
 const HTTP_DEADLINE_MS = Number(process.env.PAPER_FETCH_HTTP_DEADLINE_MS || 120000); // hard wall-clock cap per request INCLUDING redirects
 const TOOL_DEADLINE_MS = Number(process.env.PAPER_FETCH_TOOL_DEADLINE_MS || 300000); // hard cap per tool call (fallback chains included)
+const LOCAL_DIR = process.env.PAPER_FETCH_LOCAL_DIR || ''; // single drop folder for caller-supplied copies; empty = open_file disabled
 
 const log = (...a) => process.stderr.write(a.join(' ') + '\n');
 
@@ -297,13 +300,59 @@ async function fetchDoiOrOpenHtml(doi, urls = []) {
   throw new Error('DOI/OpenAlex metadata did not lead to retrievable open full text');
 }
 
-async function paperFulltextFetch({ paper_id, include_references = false, offset_line = 1, limit_lines = DEFAULT_LIMIT_LINES } = {}) {
+// --- caller-supplied open copy (URL or drop-folder file) ---------------------
+// The copy's provenance is recorded (source + bytes digest); identity against the
+// requested paper_id stays the CALLER's check — the title in the text is returned
+// for exactly that comparison. open_file accepts a bare name only, resolved inside
+// PAPER_FETCH_LOCAL_DIR: scope is closed by construction, not by filtering paths.
+async function fetchSupplied({ open_url, open_file }) {
+  let buf; let origin;
+  if (open_file) {
+    if (!LOCAL_DIR) throw new Error('open_file is disabled: PAPER_FETCH_LOCAL_DIR is not configured');
+    if (/[/\\]|\.\./.test(open_file)) throw new Error('open_file must be a bare file name inside the configured drop folder');
+    const rootReal = realpathSync(LOCAL_DIR);
+    let real;
+    try { real = realpathSync(path.join(rootReal, open_file)); }
+    catch { throw new Error(`open_file not found in drop folder: ${open_file}`); }
+    if (real !== rootReal && !real.startsWith(rootReal + path.sep)) throw new Error('open_file escapes the drop folder');
+    buf = readFileSync(real);
+    origin = `drop-folder:${open_file}`;
+  } else {
+    const r = await httpGet(open_url, { binary: true });
+    if (r.status !== 200 || !r.body || !r.body.length) throw new Error(`open_url returned status ${r.status}`);
+    buf = r.body;
+    origin = r.url || open_url;
+  }
+  const kind = open_file ? 'user-supplied-file' : 'user-supplied-url';
+  const bytes_sha256 = createHash('sha256').update(buf).digest('hex');
+  if (buf.slice(0, 5).toString('latin1').startsWith('%PDF')) {
+    const text = await pdftotext(buf);
+    return { source: kind, source_url: origin, title: '', text, bytes_sha256 };
+  }
+  const parsed = ar5ivToText(buf.toString('utf8'));
+  if (parsed.text.length < 1000) throw new Error('supplied source is neither a PDF nor substantial HTML full text');
+  return { source: kind, source_url: origin, title: parsed.title, text: parsed.text, bytes_sha256 };
+}
+
+async function paperFulltextFetch({ paper_id, include_references = false, offset_line = 1, limit_lines = DEFAULT_LIMIT_LINES, open_url, open_file } = {}) {
   const parsed = parsePaperId(paper_id);
   let metadata = { title: '', year: null, authors: [] };
   let identifiers = { openalex: null, doi: null, arxiv: null };
   let fetched;
 
-  if (parsed.kind === 'arxiv') {
+  if (open_url || open_file) {
+    fetched = await fetchSupplied({ open_url, open_file });
+    if (parsed.kind === 'arxiv') identifiers.arxiv = parsed.value;
+    else {
+      try {
+        const resolved = await resolveOpenAlex(parsed);
+        if (resolved) { metadata = resolved.metadata; identifiers = resolved.identifiers; }
+      } catch (e) { log('metadata resolve skipped for supplied copy:', e.message); }
+      if (parsed.kind === 'doi' && !identifiers.doi) identifiers.doi = parsed.value;
+      if (parsed.kind === 'openalex' && !identifiers.openalex) identifiers.openalex = parsed.value;
+    }
+    if (!metadata.title) metadata.title = fetched.title;
+  } else if (parsed.kind === 'arxiv') {
     identifiers.arxiv = parsed.value;
     fetched = await fetchArxiv(parsed.value);
     metadata.title = fetched.title;
@@ -350,6 +399,7 @@ async function paperFulltextFetch({ paper_id, include_references = false, offset
     authors: metadata.authors,
     source: fetched.source,
     source_url: fetched.source_url,
+    ...(fetched.bytes_sha256 ? { supplied_sha256: fetched.bytes_sha256 } : {}),
     locator_scheme: 'content_sha256 + global extracted line number',
     content_sha256: contentSha256,
     total_lines: lines.length,
@@ -373,6 +423,8 @@ const TOOLS = [
         include_references: { type: 'boolean', description: 'Keep the bibliography section (default false — dropped to save context).' },
         offset_line: { type: 'number', description: '1-indexed global extracted line to start from (default 1).' },
         limit_lines: { type: 'number', description: 'Lines to return (default 500, max 5000).' },
+        open_url: { type: 'string', description: 'Caller-known OPEN copy URL (e.g. author self-archive) used when metadata leads nowhere. Provenance is recorded (source=user-supplied-url + bytes digest); verify the returned title against the requested paper.' },
+        open_file: { type: 'string', description: 'Bare file name of a caller-supplied copy inside the configured drop folder (PAPER_FETCH_LOCAL_DIR). Paths and ".." are refused. Provenance recorded as source=user-supplied-file.' },
       },
       required: ['paper_id'],
     },
