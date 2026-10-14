@@ -21,9 +21,11 @@ import { createHash } from 'node:crypto';
 
 const PROTOCOL = '2025-03-26';
 const SERVER_NAME = 'paper-fetch-mcp';
-const SERVER_VERSION = '0.2.1';
+const SERVER_VERSION = '0.3.0';
 const DEFAULT_LIMIT_LINES = 500;
-const HTTP_TIMEOUT_MS = 45000;
+const HTTP_TIMEOUT_MS = 45000; // socket idle — a trickling server never trips this
+const HTTP_DEADLINE_MS = Number(process.env.PAPER_FETCH_HTTP_DEADLINE_MS || 120000); // hard wall-clock cap per request INCLUDING redirects
+const TOOL_DEADLINE_MS = Number(process.env.PAPER_FETCH_TOOL_DEADLINE_MS || 300000); // hard cap per tool call (fallback chains included)
 
 const log = (...a) => process.stderr.write(a.join(' ') + '\n');
 
@@ -72,25 +74,32 @@ function parsePaperId(raw) {
 }
 
 // --- HTTP GET with redirect follow (text or binary) -------------------------
-function httpGet(url, { binary = false, redirects = 5 } = {}) {
+function httpGet(url, { binary = false, redirects = 5, deadlineAt = Date.now() + HTTP_DEADLINE_MS } = {}) {
   return new Promise((resolve, reject) => {
+    const remain = deadlineAt - Date.now();
+    if (remain <= 0) return reject(new Error(`http deadline exceeded before request (${url})`));
     const transport = new URL(url).protocol === 'http:' ? http : https;
+    // Hard wall-clock wall: the idle timeout below never fires on a server that trickles
+    // bytes, and each redirect used to reset the budget — this timer caps the whole chain.
+    const killer = setTimeout(() => { req.destroy(new Error(`http deadline exceeded (${Math.round(HTTP_DEADLINE_MS / 1000)}s) at ${url}`)); }, remain);
     const req = transport.get(url, { timeout: HTTP_TIMEOUT_MS, headers: { 'User-Agent': `${SERVER_NAME}/${SERVER_VERSION}`, 'Accept-Encoding': 'identity' } }, (res) => {
       const { statusCode, headers } = res;
       if (statusCode >= 300 && statusCode < 400 && headers.location && redirects > 0) {
         res.resume();
+        clearTimeout(killer);
         const next = new URL(headers.location, url).toString();
-        return resolve(httpGet(next, { binary, redirects: redirects - 1 }));
+        return resolve(httpGet(next, { binary, redirects: redirects - 1, deadlineAt }));
       }
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => {
+        clearTimeout(killer);
         const buf = Buffer.concat(chunks);
         resolve({ status: statusCode, headers, url, body: binary ? buf : buf.toString('utf8') });
       });
     });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('http timeout')); });
+    req.on('error', (e) => { clearTimeout(killer); reject(e); });
+    req.on('timeout', () => { clearTimeout(killer); req.destroy(); reject(new Error('http timeout')); });
   });
 }
 
@@ -377,6 +386,17 @@ async function callTool(name, args) {
 
 // --- JSON-RPC / stdio loop --------------------------------------------------
 function send(msg) { process.stdout.write(JSON.stringify(msg) + '\n'); }
+// Fail-fast at the tool boundary: a worker must never hang on a source that neither
+// answers nor refuses. On expiry the caller gets an explicit error to record the paper
+// as not-obtained and move on; lingering sockets are reaped by their own deadlines.
+function withDeadline(promise, ms, label) {
+  let t;
+  const timer = new Promise((_, rej) => {
+    t = setTimeout(() => rej(new Error(`${label}: deadline exceeded after ${Math.round(ms / 1000)}s — source did not answer in time; treat the full text as not obtained`)), ms);
+  });
+  return Promise.race([promise, timer]).finally(() => clearTimeout(t));
+}
+
 function reply(id, result) { send({ jsonrpc: '2.0', id, result }); }
 function replyErr(id, code, message) { send({ jsonrpc: '2.0', id, error: { code, message } }); }
 
@@ -396,7 +416,7 @@ async function handle(msg) {
   if (method === 'tools/call') {
     const { name, arguments: args } = params || {};
     try {
-      const data = await callTool(name, args);
+      const data = await withDeadline(callTool(name, args), TOOL_DEADLINE_MS, name);
       return reply(id, { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] });
     } catch (e) {
       return reply(id, { content: [{ type: 'text', text: `ERROR: ${e.message}` }], isError: true });
